@@ -1,0 +1,41 @@
+# Python
+.env
+.env.local
+.env.*.local
+__pycache__/
+*.pyc
+*.egg-info/
+
+# 가상환경
+.venv/
+venv/
+
+# 빌드
+dist/
+build/
+
+# 테스트 캐시
+.pytest_cache/
+
+# 데이터베이스
+*.db
+
+# 로그 파일
+*.log
+*.log.err
+uvicorn.log
+uvicorn.log.err
+
+# Claude Code 설정
+.claude/
+
+# IDE 설정
+.vscode/
+.idea/
+.DS_Store
+
+# 보안 키 파일
+*.pem
+*.key
+serviceAccountKey.json
+firebase-adminsdk-*.json
