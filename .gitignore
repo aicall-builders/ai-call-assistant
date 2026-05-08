@@ -39,3 +39,8 @@ uvicorn.log.err
 *.key
 serviceAccountKey.json
 firebase-adminsdk-*.json
+
+# Lambda 빌드 산출물
+lambda/dist/
+lambda/package/
+lambda/*.zip
