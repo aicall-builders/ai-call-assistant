@@ -101,6 +101,91 @@ def match_keywords(text, industry='food'):
 
 
 # ══════════════════════════════════════════════════════════
+# STT 정규화 (1차 LLM)
+# ══════════════════════════════════════════════════════════
+def normalize_stt_with_llm(stt_text, call_created_at=None):
+    """
+    STT 결과를 정규화:
+    - 필러 제거 (음, 어, 그, 저 등)
+    - 문맥/문법 보정
+    - 시간 표현 → 실제 날짜
+    - 전화번호 포맷 통일
+    - 화자 라벨 변경 ([화자1] → 발신자:, [화자2] → 수신자:)
+    - 비언어는 [한숨], [웃음] 등으로 표시
+    """
+    if not ANTHROPIC_API_KEY:
+        print("[NORMALIZE] API 키 없음 - 정규화 스킵")
+        return stt_text
+
+    from datetime import datetime
+    if call_created_at:
+        if isinstance(call_created_at, str):
+            base_time = call_created_at
+        else:
+            base_time = call_created_at.strftime("%Y-%m-%d %H:%M (%A)")
+    else:
+        base_time = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+
+    prompt = f"""다음은 통화 녹음의 STT 변환 텍스트입니다. 이 텍스트를 정규화해주세요.
+
+[통화 발생 시점]
+{base_time}
+
+[원본 STT 텍스트]
+{stt_text}
+
+[정규화 규칙]
+1. 필러 제거: "음", "어", "아", "그", "저" 같은 의미 없는 추임새 제거
+2. 문맥/문법 보정: 한글 문맥상 부자연스러운 표현 자연스럽게 수정 (단, 의미는 보존)
+3. 시간 표현 변환: "내일", "오늘", "다음주 월요일", "이번 주말" 같은 상대적 시간 표현을 통화 발생 시점 기준 실제 날짜(YYYY-MM-DD)로 변환
+4. 시각 변환: "저녁 7시" → "19:00", "오전 11시" → "11:00" 등 24시간제로
+5. 전화번호 포맷: "공일공 일이삼사 오육칠팔" 같은 음성을 "010-1234-5678" 형식으로 통일
+6. 화자 라벨 변경: "[화자1]" → "발신자:", "[화자2]" → "수신자:"
+7. 비언어 표시: 한숨, 웃음, 침묵 등은 [한숨], [웃음], [침묵] 등으로 표시
+8. 비속어: 그대로 유지 (마스킹 X)
+
+[중요]
+- 원본 의미를 절대 왜곡하지 마세요
+- 명시되지 않은 정보를 추가하지 마세요
+- 정규화된 텍스트만 응답하세요 (설명, 주석, 마크다운 없이)
+
+[정규화된 텍스트]"""
+
+    try:
+        res = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {ANTHROPIC_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "max_tokens": 2048,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1
+            },
+            timeout=30
+        )
+        res.raise_for_status()
+        data = res.json()
+        normalized = data['choices'][0]['message']['content'].strip()
+        
+        if '```' in normalized:
+            parts = normalized.split('```')
+            if len(parts) >= 2:
+                normalized = parts[1]
+                if normalized.startswith('text\n'):
+                    normalized = normalized[5:]
+                normalized = normalized.strip()
+        
+        print(f"[NORMALIZE] 정규화 완료. 길이: {len(stt_text)} → {len(normalized)}")
+        return normalized
+
+    except Exception as e:
+        print(f"[NORMALIZE ERROR] {str(e)}")
+        return stt_text  # 실패 시 원본 반환
+
+# ══════════════════════════════════════════════════════════
 # LLM 요약 (구조화 정보 추출)
 # ══════════════════════════════════════════════════════════
 def summarize_with_llm(stt_text, caller_number=None, duration_sec=None, store_name=None):
@@ -393,12 +478,44 @@ def calls_upload(event, uid):
     caller_number    = body.get('counterpart_number') or body.get('caller_number')
     caller_category  = body.get('caller_category', 'UNCLASSIFIED')
     duration      = body.get('duration_seconds') or body.get('duration')
+    recorded_at   = body.get('recorded_at') or body.get('callStartedAt') or body.get('call_started_at')
 
     if not all([store_id, file_name]):
         return response(400, {'message': 'store_id, file_name은 필수입니다.'})
 
     if duration and duration < 5:
         return response(400, {'message': '통화 길이가 너무 짧습니다. (5초 이하)'})
+
+    # 🕐 1시간 이내 통화만 업로드 허용
+    if recorded_at:
+        from datetime import datetime, timezone, timedelta
+        try:
+            # ISO 8601 형식 파싱 (예: "2026-05-11T14:30:00+09:00")
+            if isinstance(recorded_at, str):
+                recorded_dt = datetime.fromisoformat(recorded_at.replace('Z', '+00:00'))
+            else:
+                # Unix timestamp (밀리초 또는 초)
+                ts = float(recorded_at)
+                if ts > 1e12:  # 밀리초
+                    ts = ts / 1000
+                recorded_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            
+            now = datetime.now(timezone.utc)
+            age = now - recorded_dt
+            
+            if age > timedelta(hours=1):
+                age_hours = age.total_seconds() / 3600
+                print(f"[UPLOAD REJECT] 통화가 너무 오래됨: {age_hours:.1f}시간 전")
+                return response(400, {
+                    'message': f'1시간 이내의 통화만 업로드 가능합니다. (이 통화: {age_hours:.1f}시간 전)',
+                    'recorded_at': recorded_at,
+                    'age_hours': round(age_hours, 1)
+                })
+        except Exception as e:
+            print(f"[UPLOAD WARN] recorded_at 파싱 실패: {e}, 검증 스킵")
+    else:
+        # recorded_at 없으면 경고만 (당분간 호환성 유지)
+        print(f"[UPLOAD WARN] recorded_at 없음. 1시간 검증 스킵")
 
     conn = get_db()
     try:
@@ -555,10 +672,20 @@ def clova_webhook(event):
 
             if result == 'SUCCEEDED':
                 segments  = body.get('segments', [])
-                full_text = '\n'.join([
+                raw_text = '\n'.join([
                     f"[화자{seg.get('speaker', {}).get('label', '?')}]: {seg.get('text', '').strip()}"
                     for seg in segments if seg.get('text', '').strip()
                 ]) or body.get('text', '')
+
+                # 🔧 1차 LLM: STT 정규화
+                cursor.execute("SELECT created_at FROM calls WHERE id = %s", (call_id,))
+                call_info = cursor.fetchone()
+                call_created_at = call_info['created_at'] if call_info else None
+                
+                full_text = normalize_stt_with_llm(raw_text, call_created_at)
+                
+                print(f"[WEBHOOK] 정규화 전: {raw_text[:200]}")
+                print(f"[WEBHOOK] 정규화 후: {full_text[:200]}")
 
                 matched_kws, matched_cat = match_keywords(full_text)
 
@@ -816,33 +943,36 @@ def get_summary(summary_id, uid):
 # 🧹 임시: 기존 데모 데이터 청소 (실행 후 삭제!!)
 # ══════════════════════════════════════════════════════════
 def demo_clean(uid):
-    """uid 사용자의 demo_*.m4a 파일을 가진 모든 통화와 요약을 삭제."""
+    """uid 사용자의 모든 통화/요약/S3 파일을 삭제."""
     conn = get_db()
-    deleted = {'calls': 0, 'summaries': 0}
+    deleted = {'calls': 0, 'summaries': 0, 's3_files': 0, 's3_failed': 0}
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT c.id FROM calls c
+                SELECT c.id, c.s3_key FROM calls c
                 JOIN users u ON c.user_id = u.id
                 WHERE u.firebase_uid = %s
-                  AND c.s3_key LIKE %s
-            """, (uid, '%/demo_%'))
+            """, (uid,))
             rows = cursor.fetchall()
             call_ids = [r['id'] for r in rows]
+            s3_keys = [r['s3_key'] for r in rows if r['s3_key']]
+
+            print(f"[CLEAN] uid={uid}, 삭제 대상: {len(call_ids)}개 통화, {len(s3_keys)}개 S3 파일")
 
             if call_ids:
                 placeholders = ','.join(['%s'] * len(call_ids))
-                cursor.execute(
-                    f"DELETE FROM summaries WHERE call_id IN ({placeholders})",
-                    call_ids
-                )
+                cursor.execute(f"DELETE FROM summaries WHERE call_id IN ({placeholders})", call_ids)
                 deleted['summaries'] = cursor.rowcount
-
-                cursor.execute(
-                    f"DELETE FROM calls WHERE id IN ({placeholders})",
-                    call_ids
-                )
+                cursor.execute(f"DELETE FROM calls WHERE id IN ({placeholders})", call_ids)
                 deleted['calls'] = cursor.rowcount
+
+            for key in s3_keys:
+                try:
+                    s3_client.delete_object(Bucket=S3_BUCKET, Key=key)
+                    deleted['s3_files'] += 1
+                except Exception as e:
+                    print(f"[S3 DELETE FAIL] {key}: {e}")
+                    deleted['s3_failed'] += 1
 
         conn.commit()
     finally:
@@ -850,7 +980,7 @@ def demo_clean(uid):
 
     return response(200, {
         'success': True,
-        'message': f'기존 데모 데이터 청소 완료',
+        'message': '내 데이터 전체 청소 완료',
         'deleted': deleted
     })
 
@@ -1058,3 +1188,4 @@ def migrate_add_extracted_info():
         return response(200, result)
     finally:
         conn.close()
+
