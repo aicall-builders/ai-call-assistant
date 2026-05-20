@@ -24,7 +24,6 @@ BUCKET_NAME    = os.environ.get("S3_BUCKET", "call-recoder-audio-1017")
 CLOVA_API_URL  = os.environ.get("CLOVA_API_URL", "")
 CLOVA_SECRET   = os.environ.get("CLOVA_SECRET_KEY", "")
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 MAX_RETRY      = int(os.environ.get("STT_MAX_RETRY", 3))
 STALE_MINUTES  = int(os.environ.get("STT_STALE_MINUTES", 5))
@@ -165,7 +164,7 @@ def check_pending_stt(event=None, context=None):
     pending = _query_pending_calls()
     logger.info(f"[Polling] 대상 {len(pending)}건")
 
-    result = {"total": len(pending), "clova_ok": 0, "whisper_ok": 0, "failed": 0}
+    result = {"total": len(pending), "clova_ok": 0, "failed": 0}
 
     for call in pending:
         call_id     = call["id"]
@@ -180,12 +179,10 @@ def check_pending_stt(event=None, context=None):
                 else:
                     result["failed"] += 1
             else:
-                ok = _run_whisper_fallback(call_id, call.get("s3_key"))
-                if ok:
-                    result["whisper_ok"] += 1
-                else:
-                    result["failed"] += 1
-
+                _update_call_status(call_id, status="error",
+                                    error_message="CLOVA STT 최대 재시도 초과")
+                result["failed"] += 1
+                
         except Exception as e:
             logger.error(f"[Polling] call_id={call_id} 오류: {e}", exc_info=True)
             _update_call_status(call_id, status="error", error_message=str(e))
@@ -235,8 +232,7 @@ def _poll_clova(call_id: str, job_id: str, retry_count: int) -> bool:
             return True
 
         elif status in ("failed", "error"):
-            logger.warning(f"[CLOVA] 실패 → Whisper로 전환 call_id={call_id}")
-            # retry_count를 MAX_RETRY로 올려서 다음 폴링에서 Whisper 분기
+            logger.warning(f"[CLOVA] 실패 → 최대 재시도로 전환 call_id={call_id}")
             _increment_retry(call_id, force_max=True)
             return False
 
@@ -258,40 +254,6 @@ def _extract_transcript(data: dict) -> str:
         return " ".join(seg.get("text", "") for seg in segments).strip()
     return data.get("text", "")
 
-
-# ── Whisper fallback ──────────────────────────────────────────────────────────
-
-def _run_whisper_fallback(call_id: str, s3_key: str | None) -> bool:
-    logger.info(f"[Whisper] fallback 시작 call_id={call_id} s3_key={s3_key}")
-
-    if not s3_key:
-        logger.error(f"[Whisper] s3_key 없음 call_id={call_id}")
-        _update_call_status(call_id, status="error", error_message="s3_key missing")
-        return False
-
-    try:
-        import openai
-        openai.api_key = OPENAI_API_KEY
-
-        obj        = s3.get_object(Bucket=BUCKET_NAME, Key=s3_key)
-        audio_bytes = obj["Body"].read()
-        filename   = s3_key.split("/")[-1]
-
-        response = openai.audio.transcriptions.create(
-            model="whisper-1",
-            file=(filename, audio_bytes, _content_type(os.path.splitext(filename)[-1])),
-            language="ko",
-            response_format="text",
-        )
-        transcript = response.strip() if isinstance(response, str) else response.text.strip()
-        _update_call_status(call_id, status="transcribed", stt_result=transcript)
-        logger.info(f"[Whisper] 완료 call_id={call_id} chars={len(transcript)}")
-        return True
-
-    except Exception as e:
-        logger.error(f"[Whisper] 오류 call_id={call_id}: {e}")
-        _update_call_status(call_id, status="error", error_message=f"whisper: {e}")
-        return False
 
 
 # ── DB 업데이트 헬퍼 ──────────────────────────────────────────────────────────
