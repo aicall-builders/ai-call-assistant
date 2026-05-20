@@ -9,6 +9,8 @@ on:
       - 'lambda/call_handler.py'
       - 'lambda/nlp_handler.py'
       - 'lambda/keywords.json'
+      - 'lambda/requirements.txt'
+      - 'lambda/redis_client.py'
 
 jobs:
   deploy-auth:
@@ -24,7 +26,7 @@ jobs:
       - name: Check if auth_handler changed
         id: check_auth
         run: |
-          if git diff --name-only HEAD~1 HEAD | grep -q "lambda/auth_handler.py"; then
+          if git diff --name-only HEAD~1 HEAD | grep -qE "lambda/auth_handler.py|lambda/requirements.txt|lambda/redis_client.py"; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
@@ -42,7 +44,11 @@ jobs:
         if: steps.check_auth.outputs.changed == 'true'
         run: |
           cd lambda
-          zip auth_handler.zip auth_handler.py
+          pip install -r requirements.txt -t package/
+          cp auth_handler.py redis_client.py package/
+          cd package
+          zip -r ../auth_handler.zip .
+          cd ..
           aws lambda update-function-code \
             --function-name call-recorder-api-auth \
             --zip-file fileb://auth_handler.zip
@@ -61,7 +67,7 @@ jobs:
       - name: Check if call_handler changed
         id: check_call
         run: |
-          if git diff --name-only HEAD~1 HEAD | grep -qE "lambda/call_handler.py|lambda/keywords.json"; then
+          if git diff --name-only HEAD~1 HEAD | grep -qE "lambda/call_handler.py|lambda/keywords.json|lambda/requirements.txt|lambda/redis_client.py"; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
@@ -79,7 +85,11 @@ jobs:
         if: steps.check_call.outputs.changed == 'true'
         run: |
           cd lambda
-          zip call_handler.zip call_handler.py keywords.json
+          pip install -r requirements.txt -t package/
+          cp call_handler.py keywords.json redis_client.py package/
+          cd package
+          zip -r ../call_handler.zip .
+          cd ..
           aws lambda update-function-code \
             --function-name call-recorder-api-call \
             --zip-file fileb://call_handler.zip
@@ -98,7 +108,7 @@ jobs:
       - name: Check if nlp_handler changed
         id: check_nlp
         run: |
-          if git diff --name-only HEAD~1 HEAD | grep -qE "lambda/nlp_handler.py|lambda/keywords.json"; then
+          if git diff --name-only HEAD~1 HEAD | grep -qE "lambda/nlp_handler.py|lambda/keywords.json|lambda/requirements.txt|lambda/redis_client.py"; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
@@ -116,7 +126,11 @@ jobs:
         if: steps.check_nlp.outputs.changed == 'true'
         run: |
           cd lambda
-          zip nlp_handler.zip nlp_handler.py keywords.json
+          pip install -r requirements.txt -t package/
+          cp nlp_handler.py keywords.json redis_client.py package/
+          cd package
+          zip -r ../nlp_handler.zip .
+          cd ..
           aws lambda update-function-code \
             --function-name call-recorder-api-nlp \
             --zip-file fileb://nlp_handler.zip
