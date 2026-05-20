@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 s3 = boto3.client("s3")
+lambda_client = boto3.client("lambda")
 BUCKET_NAME    = os.environ.get("S3_BUCKET", "call-recoder-audio-1017")
 
 CLOVA_API_URL  = os.environ.get("CLOVA_API_URL", "")
@@ -229,6 +230,7 @@ def _poll_clova(call_id: str, job_id: str, retry_count: int) -> bool:
             transcript = _extract_transcript(data)
             _update_call_status(call_id, status="transcribed", stt_result=transcript)
             logger.info(f"[CLOVA] 완료 call_id={call_id}")
+            _invoke_nlp(call_id, transcript)
             return True
 
         elif status in ("failed", "error"):
@@ -254,6 +256,19 @@ def _extract_transcript(data: dict) -> str:
         return " ".join(seg.get("text", "") for seg in segments).strip()
     return data.get("text", "")
 
+def _invoke_nlp(call_id: str, transcript: str) -> None:
+    try:
+        lambda_client.invoke(
+            FunctionName="call-recorder-api-nlp",
+            InvocationType="Event",  # 비동기
+            Payload=json.dumps({
+                "call_id": call_id,
+                "transcript": transcript,
+            }).encode(),
+        )
+        logger.info(f"[NLP] Lambda invoke 완료 call_id={call_id}")
+    except Exception as e:
+        logger.error(f"[NLP] Lambda invoke 실패 call_id={call_id}: {e}")
 
 
 # ── DB 업데이트 헬퍼 ──────────────────────────────────────────────────────────
