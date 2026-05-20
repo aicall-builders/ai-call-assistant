@@ -24,7 +24,41 @@
 
 ---
 
-## 🏗️ 아키텍처 (백엔드 관점)
+## 🏗️ 아키텍처 변경 이력
+
+### ❌ Phase 0: 모놀리식 구조 (구버전)
+
+초기 MVP는 단일 Lambda 함수(`call-recorder-api`)가 인증·통화·NLP 처리를 모두 담당하는 **모놀리식 구조**였습니다.
+
+```
+Android / Web
+      │
+      ▼
+API Gateway
+      │
+      ▼
+call-recorder-api (단일 Lambda)
+  ├── 카카오 로그인
+  ├── stores CRUD
+  ├── calls CRUD
+  ├── CLOVA STT
+  └── LLM 요약
+      │
+      ▼
+RDS / S3 / 외부 API
+```
+
+**문제점:**
+- 한 함수에 모든 로직이 집중되어 에러 발생 시 원인 파악이 어려움
+- 특정 기능만 수정해도 전체 함수를 재배포해야 함
+- CloudWatch 로그가 뒤섞여 모니터링이 불편함
+- 기능별 독립 스케일링 불가
+
+---
+
+### ✅ Phase 1: 핸들러 분리 구조 (현재)
+
+오류 분석 용이성과 독립 배포를 위해 **기능별 Lambda 분리**를 진행했습니다.
 
 ```
         Android / Web Client
@@ -32,38 +66,49 @@
                 │ HTTPS + Firebase ID Token
                 ▼
    ┌─────────────────────────────────┐
-   │  AWS API Gateway (HTTP API)     │
-   └────────────────┬────────────────┘
-                    ▼
-   ┌─────────────────────────────────┐
-   │  AWS Lambda (Python 3.12)       │
-   │  call-recorder-api              │
-   │  VPC 프라이빗 서브넷            │
-   │                                 │
-   │  ┌───────────────────────────┐  │
-   │  │ Router (단일 핸들러)       │  │
-   │  ├───────────────────────────┤  │
-   │  │ Auth (Firebase Admin SDK) │  │
-   │  ├───────────────────────────┤  │
-   │  │ Business Logic            │  │
-   │  ├───────────────────────────┤  │
-   │  │ Rule-based NLP + LLM      │  │
-   │  └───────────────────────────┘  │
-   └──┬──────────┬──────────┬────────┘
-      │ Interface│ Gateway  │ VPC 내부
-      ▼ Endpoint ▼ Endpoint ▼
-   ┌────────┐ ┌────────┐ ┌────────┐
-   │Secrets │ │   S3   │ │  RDS   │
-   │Manager │ │ (음성) │ │MySQL 8 │
-   └────────┘ └────────┘ └────────┘
-                    │
-                    ▼   외부 API
-            ┌─────────────────┐
-            │ CLOVA Speech    │
-            │ OpenAI          │
-            │ Kakao           │
-            └─────────────────┘
+   │  AWS API Gateway (REST API)     │
+   │  avrq2kzfp9 (ap-northeast-2)   │
+   └────┬──────────┬──────────┬──────┘
+        │          │          │
+        ▼          ▼          ▼
+┌──────────┐ ┌──────────┐ ┌──────────┐
+│  auth    │ │  call    │ │   nlp    │
+│ handler  │ │ handler  │ │ handler  │
+│          │ │          │ │          │
+│ 카카오   │ │ stores   │ │ CLOVA    │
+│ 로그인   │ │ calls    │ │ Webhook  │
+│ Firebase │ │ CRUD     │ │ LLM 요약 │
+└────┬─────┘ └────┬─────┘ └────┬─────┘
+     │             │             │
+     ▼             ▼             ▼
+  Firebase       RDS/S3       CLOVA/GPT
 ```
+
+**개선 효과:**
+- 기능별 독립 배포 → 수정 범위 최소화
+- CloudWatch 로그가 핸들러별로 분리되어 에러 추적 용이
+- 인증 오류 / 통화 오류 / NLP 오류를 개별 모니터링 가능
+- 향후 기능별 독립 스케일링 기반 마련
+
+---
+
+## 📁 Lambda 구조
+
+```
+lambda/
+  ├── auth_handler.py   # 카카오 로그인, Firebase Custom Token 발급
+  ├── call_handler.py   # stores/calls CRUD, S3 업로드, STT 처리 시작
+  ├── nlp_handler.py    # CLOVA Webhook 수신, LLM 요약 처리
+  ├── keywords.json     # 룰베이스 NLP 키워드 사전
+  ├── requirements.txt  # 의존성
+  └── deploy.md         # 배포 절차
+```
+
+| 파일 | Lambda 함수 | 담당 엔드포인트 |
+|------|------------|--------------|
+| `auth_handler.py` | `call-recorder-api-auth` | `POST /auth/kakao` |
+| `call_handler.py` | `call-recorder-api-call` | `/stores`, `/calls/*`, `/summaries/*` |
+| `nlp_handler.py` | `call-recorder-api-nlp` | `POST /clova/webhook` |
 
 ---
 
@@ -71,7 +116,7 @@
 
 ### Runtime & Infrastructure
 - **AWS Lambda** (Python 3.12)
-- **AWS API Gateway** (HTTP API, 단일 진입점)
+- **AWS API Gateway** (REST API, `avrq2kzfp9`)
 - **AWS RDS MySQL 8.0** (db.t4g.micro, 프라이빗 서브넷)
 - **AWS S3** (Seoul 리전, SSE-S3 암호화)
 - **AWS Secrets Manager** (DB 자격증명, Firebase Admin SDK)
@@ -90,22 +135,23 @@
 
 ## 🔌 API 엔드포인트
 
-진입점: AWS API Gateway HTTP API · 인증: `Authorization: Bearer <Firebase ID Token>`
+진입점: `https://avrq2kzfp9.execute-api.ap-northeast-2.amazonaws.com/prod`  
+인증: `Authorization: Bearer <Firebase ID Token>`
 
-| Method | Path | 설명 | 인증 |
-|--------|------|------|------|
-| POST | `/auth/kakao` | 카카오 토큰 → Firebase Custom Token 교환 | ❌ |
-| POST | `/clova/webhook` | CLOVA STT 완료 콜백 수신 | ❌ (CLOVA만) |
-| POST | `/stores` | 가게 등록 | ✅ |
-| GET | `/stores` | 내 가게 목록 | ✅ |
-| POST | `/calls/upload` | S3 presigned URL 발급 + calls INSERT | ✅ |
-| POST | `/calls/{id}/process` | CLOVA STT 처리 시작 | ✅ |
-| GET | `/calls` | 통화 목록 (필터: store_id, status) | ✅ |
-| GET | `/calls/{id}` | 통화 상세 | ✅ |
-| GET | `/calls/{id}/audio` | 음성 재생용 presigned URL (10분) | ✅ |
-| PATCH | `/calls/{id}` | 분류 변경 (BUSINESS/PERSONAL) | ✅ |
-| DELETE | `/calls/{id}` | 통화 삭제 | ✅ |
-| GET | `/summaries/{id}` | 요약 상세 | ✅ |
+| Method | Path | 설명 | 인증 | 핸들러 |
+|--------|------|------|------|--------|
+| POST | `/auth/kakao` | 카카오 토큰 → Firebase Custom Token 교환 | ❌ | auth |
+| POST | `/clova/webhook` | CLOVA STT 완료 콜백 수신 | ❌ | nlp |
+| POST | `/stores` | 가게 등록 | ✅ | call |
+| GET | `/stores` | 내 가게 목록 | ✅ | call |
+| POST | `/calls/upload` | S3 presigned URL 발급 + calls INSERT | ✅ | call |
+| POST | `/calls/{id}/process` | CLOVA STT 처리 시작 | ✅ | call |
+| GET | `/calls` | 통화 목록 (필터: store_id, status) | ✅ | call |
+| GET | `/calls/{id}` | 통화 상세 | ✅ | call |
+| GET | `/calls/{id}/audio` | 음성 재생용 presigned URL (10분) | ✅ | call |
+| PATCH | `/calls/{id}` | 분류 변경 (BUSINESS/PERSONAL) | ✅ | call |
+| DELETE | `/calls/{id}` | 통화 삭제 | ✅ | call |
+| GET | `/summaries/{id}` | 요약 상세 | ✅ | call |
 
 ---
 
@@ -131,12 +177,10 @@ Lambda 15분 타임아웃 제약을 우회하기 위해 **CLOVA async 모드 + W
 
 ### NLP 처리 (하이브리드)
 
-LLM 의존도를 낮추기 위해 룰베이스 NLP를 1차로 적용합니다. 룰베이스가 채우지 못한 슬롯이 임계 이상일 때만 GPT-4o-mini를 fallback으로 호출하여 **LLM 호출 비율을 25% 이하로 제어**합니다.
-
 | 단계 | 처리 방식 | LLM 사용 |
 |------|---------|--------|
 | 1. 의도 분류 | 키워드·패턴 룰 (8종 분류) | ❌ |
-| 2. 엔터티 추출 | 정규식·사전 (날짜·시간·인원·메뉴·금액·전화번호) | ❌ |
+| 2. 엔터티 추출 | 정규식·사전 (날짜·시간·인원·메뉴·전화번호) | ❌ |
 | 3. 구조화 카드 채우기 | 룰베이스 템플릿 슬롯 매핑 | ❌ |
 | 4. 룰 실패 케이스 보강 | 임계 초과 시에만 LLM 호출 | ⚠️ 일부 |
 | 5. 통화 요약 생성 | 룰 우선, 자연스러움 부족 시 LLM | ⚠️ 일부 |
@@ -183,8 +227,6 @@ calls       -- 통화 메타데이터 (s3_key, stt_result, status)
 summaries   -- AI 요약 결과 (category, keywords, extracted_info JSON)
 ```
 
-모든 ID는 UUID4 문자열(`VARCHAR(64)`). MySQL JSON 컬럼으로 `stt_result`, `keywords`, `extracted_info` 저장.
-
 ---
 
 ## 🚀 배포
@@ -195,11 +237,15 @@ Lambda 환경변수에는 **식별자 성격의 값**만 두고, 비밀은 Secre
 `.env.example` 참조 (로컬 개발용 placeholder).
 
 ### 배포 절차 (Phase 1)
-1. 코드 수정 (`lambda/lambda_function.py` 또는 `lambda/keywords.json`)
-2. AWS Console → Lambda → `call-recorder-api` → Deploy
+1. 코드 수정 (`lambda/auth_handler.py`, `call_handler.py`, `nlp_handler.py`)
+2. AWS Console → Lambda → 해당 함수 → Deploy
 3. Smoke test (인증·매장·통화 조회)
 
-자동화는 Phase 2 로드맵.
+| 수정 대상 | 배포 함수 |
+|---------|---------|
+| 로그인 로직 | `call-recorder-api-auth` |
+| 통화/가게 CRUD | `call-recorder-api-call` |
+| STT/LLM 처리 | `call-recorder-api-nlp` |
 
 ---
 
@@ -210,8 +256,19 @@ Lambda 환경변수에는 **식별자 성격의 값**만 두고, 비밀은 Secre
 | 통화 종료 → 카드 알림 도달 (평균) | 60초 이내 |
 | API 응답 (p95, /calls 목록) | 1초 이내 |
 | 통화 → 카드 처리 성공률 | ≥ 95% |
-| LLM Fallback 호출 비율 | ≤ 25% (원가 절감 KPI) |
+| LLM Fallback 호출 비율 | ≤ 25% |
 | API 서버 가용성 (월) | ≥ 99.5% |
+
+---
+
+## 📈 향후 로드맵 (Phase 2)
+
+- GitHub Actions 기반 자동 배포 파이프라인
+- 단위 테스트 추가
+- Redis 캐시 연결 (키워드 룰셋 핫리로드)
+- Grafana + Slack 알림 연동
+- LLM 호출 PII 마스킹 (전화번호·이름 토큰화)
+- CLOVA Webhook 재시도 메커니즘
 
 ---
 
@@ -227,22 +284,10 @@ Lambda 환경변수에는 **식별자 성격의 값**만 두고, 비밀은 Secre
 
 ---
 
-## 📈 향후 로드맵 (Phase 2)
-
-- Lambda 코드 모듈 분리
-- GitHub Actions 기반 자동 배포 파이프라인
-- 단위 테스트 추가
-- 키워드 룰셋 핫리로드 (Redis)
-- LLM 호출 PII 마스킹 (전화번호·이름 토큰화)
-
----
-
-
-
 ## 📄 라이선스
 
 부트캠프 학습 프로젝트입니다. 코드 참고·학습 목적의 열람은 자유이나, 본 서비스의 아키텍처·디자인·문서를 무단으로 상업적 목적에 재이용하지 않기를 부탁드립니다.
 
 ---
 
-*문서 기준: Tech Spec v2.5 (2026.05.11), API명세서 v1.0.0*
+*문서 기준: Tech Spec v3.0 (2026.05.20) — Phase 1 Lambda 분리 완료*
