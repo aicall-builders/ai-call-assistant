@@ -113,7 +113,7 @@ def analyze_with_gpt(call_id: str, transcript: str) -> None:
   }}
 }}"""
     try:
-        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        client = openai.OpenAI(api_key=OPENAI_API_KEY, timeout=55.0)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
