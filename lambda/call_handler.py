@@ -258,17 +258,45 @@ def _extract_transcript(data: dict) -> str:
 
 def _invoke_nlp(call_id: str, transcript: str) -> None:
     try:
-        lambda_client.invoke(
+        response = lambda_client.invoke(
             FunctionName="call-recorder-api-nlp",
-            InvocationType="Event",  # 비동기
+            InvocationType="RequestResponse",
             Payload=json.dumps({
                 "call_id": call_id,
                 "transcript": transcript,
             }).encode(),
         )
-        logger.info(f"[NLP] Lambda invoke 완료 call_id={call_id}")
+        payload = json.loads(response["Payload"].read())
+        body = json.loads(payload.get("body", "{}"))
+        if body:
+            _insert_summary(call_id, body)
+        logger.info(f"[NLP] 분석 및 저장 완료 call_id={call_id}")
     except Exception as e:
-        logger.error(f"[NLP] Lambda invoke 실패 call_id={call_id}: {e}")
+        logger.error(f"[NLP] invoke 실패 call_id={call_id}: {e}")
+
+
+def _insert_summary(call_id: str, result: dict) -> None:
+    sql = """
+        INSERT INTO summaries
+            (id, call_id, summary, category, sentiment,
+             action_required, keywords, extracted_info)
+        VALUES
+            (%s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (
+                str(uuid.uuid4()),
+                call_id,
+                result.get("summary", ""),
+                result.get("category", "기타"),
+                result.get("sentiment", "neutral"),
+                1 if result.get("action_required") else 0,
+                json.dumps(result.get("keywords", []), ensure_ascii=False),
+                json.dumps(result.get("extracted_info", {}), ensure_ascii=False),
+            ))
+        conn.commit()
+    logger.info(f"[Call] summaries INSERT 완료 call_id={call_id}")
 
 
 # ── DB 업데이트 헬퍼 ──────────────────────────────────────────────────────────
