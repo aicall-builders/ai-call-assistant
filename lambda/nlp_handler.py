@@ -10,6 +10,10 @@ import json
 import hashlib
 import logging
 import boto3
+import openai
+import pymysql
+import pymysql.cursors
+import uuid
 from botocore.exceptions import ClientError
 
 from redis_client import cache_get, cache_set, cache_delete, TTL_KEYWORDS
@@ -23,6 +27,22 @@ BUCKET_NAME   = os.environ.get("S3_BUCKET", "call-recoder-audio-1017")
 KEYWORDS_KEY  = os.environ.get("KEYWORDS_S3_KEY", "config/keywords.json")
 CACHE_KEY     = "nlp:keywords"          # Redis 키
 CACHE_KEY_HASH = "nlp:keywords:hash"    # S3 ETag 저장 (변경 감지용)
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+openai.api_key = OPENAI_API_KEY
+
+DB_CONFIG = {
+    "host":        os.environ.get("DB_HOST", "call-recorder-db.czem0u8m8xfi.ap-northeast-2.rds.amazonaws.com"),
+    "user":        os.environ.get("DB_USER", "admin"),
+    "password":    os.environ.get("DB_PASSWORD", ""),
+    "db":          os.environ.get("DB_NAME", "call_recorder"),
+    "charset":     "utf8mb4",
+    "cursorclass": pymysql.cursors.DictCursor,
+    "connect_timeout": 5,
+}
+
+def get_db():
+    return pymysql.connect(**DB_CONFIG)
 
 
 # ── keywords 로딩 ──────────────────────────────────────────────────────────────
@@ -74,12 +94,75 @@ def analyze_keywords(text: str, keywords: dict) -> dict:
             results[category] = found
     return results
 
+def analyze_with_gpt(call_id: str, transcript: str) -> None:
+    prompt = f"""다음 통화 내용을 분석해주세요.
+
+통화 내용:
+{transcript}
+
+아래 JSON 형식으로만 응답하세요. 다른 텍스트 없이 JSON만:
+{{
+  "summary": "통화 내용 3줄 요약",
+  "category": "문의/불만/예약/취소/기타 중 하나",
+  "sentiment": "positive/neutral/negative 중 하나",
+  "action_required": true 또는 false,
+  "keywords": ["키워드1", "키워드2"],
+  "extracted_info": {{
+    "주요_요청": "...",
+    "고객_의도": "..."
+  }}
+}}"""
+    try:
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=500,
+        )
+        raw = response.choices[0].message.content.strip()
+        result = json.loads(raw)
+        _insert_summary(call_id, result)
+        logger.info(f"[NLP] GPT 분석 완료 call_id={call_id}")
+    except json.JSONDecodeError as e:
+        logger.error(f"[NLP] GPT 응답 파싱 실패 call_id={call_id}: {e}")
+    except Exception as e:
+        logger.error(f"[NLP] GPT 분석 오류 call_id={call_id}: {e}")
+
+
+def _insert_summary(call_id: str, result: dict) -> None:
+    sql = """
+        INSERT INTO summaries
+            (id, call_id, summary, category, sentiment,
+             action_required, keywords, extracted_info)
+        VALUES
+            (%s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (
+                str(uuid.uuid4()),
+                call_id,
+                result.get("summary", ""),
+                result.get("category", "기타"),
+                result.get("sentiment", "neutral"),
+                1 if result.get("action_required") else 0,
+                json.dumps(result.get("keywords", []), ensure_ascii=False),
+                json.dumps(result.get("extracted_info", {}), ensure_ascii=False),
+            ))
+        conn.commit()
+    logger.info(f"[NLP] summaries INSERT 완료 call_id={call_id}")
 
 # ── Lambda 핸들러 ──────────────────────────────────────────────────────────────
 
 def lambda_handler(event: dict, context) -> dict:
+    if event.get("call_id") and event.get("transcript"):
+        analyze_with_gpt(event["call_id"], event["transcript"])
+        return {"statusCode": 200, "body": "ok"}
+
     path   = event.get("path", "")
     method = event.get("httpMethod", "POST")
+    
 
     # ── 관리자용 강제 리로드 엔드포인트 ──────────────────────────────────────
     if path == "/admin/reload-keywords" and method == "POST":
