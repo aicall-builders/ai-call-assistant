@@ -107,13 +107,9 @@ jobs:
 
       - name: Check if nlp_handler changed
         id: check_nlp
-        run: |
-          if git diff --name-only HEAD~1 HEAD | grep -qE "lambda/nlp_handler.py|lambda/keywords.json|lambda/requirements.txt|lambda/redis_client.py"; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
+        run: echo "changed=true" >> $GITHUB_OUTPUT
 
+        
       - name: Configure AWS credentials
         if: steps.check_nlp.outputs.changed == 'true'
         uses: aws-actions/configure-aws-credentials@v4
