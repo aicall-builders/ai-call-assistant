@@ -190,8 +190,36 @@ def check_pending_stt(event=None, context=None):
             result["failed"] += 1
 
     logger.info(f"[Polling] 완료: {result}")
+    _put_metrics(result)
     return {"statusCode": 200, "body": json.dumps(result, ensure_ascii=False)}
 
+
+def _put_metrics(result: dict) -> None:
+    try:
+        cloudwatch = boto3.client("cloudwatch")
+        cloudwatch.put_metric_data(
+            Namespace="CallRecorder/Polling",
+            MetricData=[
+                {
+                    "MetricName": "PollingTotal",
+                    "Value": result["total"],
+                    "Unit": "Count",
+                },
+                {
+                    "MetricName": "PollingClovaOk",
+                    "Value": result["clova_ok"],
+                    "Unit": "Count",
+                },
+                {
+                    "MetricName": "PollingFailed",
+                    "Value": result["failed"],
+                    "Unit": "Count",
+                },
+            ],
+        )
+        logger.info("[Metrics] CloudWatch 메트릭 전송 완료")
+    except Exception as e:
+        logger.error(f"[Metrics] 전송 실패: {e}")
 
 def _query_pending_calls() -> list[dict]:
     sql = """
