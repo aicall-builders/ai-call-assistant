@@ -1,0 +1,94 @@
+name: Deploy Lambda Functions
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'lambda/**'
+
+jobs:
+  deploy-auth:
+    name: Deploy auth_handler
+    runs-on: ubuntu-latest
+    if: |
+      contains(join(github.event.commits.*.modified, ','), 'lambda/auth_handler.py') ||
+      contains(join(github.event.commits.*.added, ','), 'lambda/auth_handler.py')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy auth_handler to Lambda
+        run: |
+          cd lambda
+          zip auth_handler.zip auth_handler.py
+          aws lambda update-function-code \
+            --function-name call-recorder-api-auth \
+            --zip-file fileb://auth_handler.zip
+          echo "✅ auth_handler 배포 완료"
+
+  deploy-call:
+    name: Deploy call_handler
+    runs-on: ubuntu-latest
+    if: |
+      contains(join(github.event.commits.*.modified, ','), 'lambda/call_handler.py') ||
+      contains(join(github.event.commits.*.added, ','), 'lambda/call_handler.py') ||
+      contains(join(github.event.commits.*.modified, ','), 'lambda/keywords.json') ||
+      contains(join(github.event.commits.*.added, ','), 'lambda/keywords.json')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy call_handler to Lambda
+        run: |
+          cd lambda
+          zip call_handler.zip call_handler.py keywords.json
+          aws lambda update-function-code \
+            --function-name call-recorder-api-call \
+            --zip-file fileb://call_handler.zip
+          echo "✅ call_handler 배포 완료"
+
+  deploy-nlp:
+    name: Deploy nlp_handler
+    runs-on: ubuntu-latest
+    if: |
+      contains(join(github.event.commits.*.modified, ','), 'lambda/nlp_handler.py') ||
+      contains(join(github.event.commits.*.added, ','), 'lambda/nlp_handler.py') ||
+      contains(join(github.event.commits.*.modified, ','), 'lambda/keywords.json') ||
+      contains(join(github.event.commits.*.added, ','), 'lambda/keywords.json')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy nlp_handler to Lambda
+        run: |
+          cd lambda
+          zip nlp_handler.zip nlp_handler.py keywords.json
+          aws lambda update-function-code \
+            --function-name call-recorder-api-nlp \
+            --zip-file fileb://nlp_handler.zip
+          echo "✅ nlp_handler 배포 완료"
