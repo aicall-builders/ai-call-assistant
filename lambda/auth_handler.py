@@ -1,9 +1,9 @@
-"""
-auth_handler.py — Firebase 토큰 검증 결과 + 유저 DB 조회 Redis 캐싱
-변경점:
-  - Firebase Admin SDK 검증 결과를 Redis에 55분 캐싱
-  - RDS 유저 정보 조회 결과도 5분 캐싱
-  - 토큰 무효화(로그아웃) 시 캐시 삭제
+﻿"""
+auth_handler.py ??Firebase ?좏겙 寃利?寃곌낵 + ?좎? DB 議고쉶 Redis 罹먯떛
+蹂寃쎌젏:
+  - Firebase Admin SDK 寃利?寃곌낵瑜?Redis??55遺?罹먯떛
+  - RDS ?좎? ?뺣낫 議고쉶 寃곌낵??5遺?罹먯떛
+  - ?좏겙 臾댄슚??濡쒓렇?꾩썐) ??罹먯떆 ??젣
 """
 import os
 import json
@@ -21,14 +21,17 @@ from redis_client import (
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# ── Firebase Admin SDK 초기화 (Lambda 컨테이너 재사용) ────────────────────────
+# ?? Firebase Admin SDK 珥덇린??(Lambda 而⑦뀒?대꼫 ?ъ궗?? ????????????????????????
 if not firebase_admin._apps:
-    cred = credentials.Certificate(
-        json.loads(os.environ.get("FIREBASE_SERVICE_ACCOUNT", "{}"))
-    )
+    import base64
+    sa_b64 = os.environ.get("FIREBASE_SERVICE_ACCOUNT_BASE64", "")
+    sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "")
+    if sa_b64:
+        sa_json = base64.b64decode(sa_b64).decode("utf-8")
+    cred = credentials.Certificate(json.loads(sa_json))
     firebase_admin.initialize_app(cred)
 
-# ── DB 설정 ───────────────────────────────────────────────────────────────────
+# ?? DB ?ㅼ젙 ???????????????????????????????????????????????????????????????????
 DB_CONFIG = {
     "host":     os.environ.get("DB_HOST", "call-recorder-db.czem0u8m8xfi.ap-northeast-2.rds.amazonaws.com"),
     "user":     os.environ.get("DB_USER", ""),
@@ -39,8 +42,7 @@ DB_CONFIG = {
     "connect_timeout": 5,
 }
 
-_db_conn = None  # DB 연결 싱글턴
-
+_db_conn = None  # DB ?곌껐 ?깃???
 
 def get_db():
     global _db_conn
@@ -49,33 +51,32 @@ def get_db():
             _db_conn = pymysql.connect(**DB_CONFIG)
         return _db_conn
     except Exception as e:
-        logger.error(f"[Auth] DB 연결 실패: {e}")
+        logger.error(f"[Auth] DB ?곌껐 ?ㅽ뙣: {e}")
         return None
 
 
-# ── Firebase 토큰 검증 ────────────────────────────────────────────────────────
+# ?? Firebase ?좏겙 寃利?????????????????????????????????????????????????????????
 
 def _token_cache_key(token: str) -> str:
-    """토큰 전체를 키로 쓰면 너무 길어서 SHA256 해시 사용"""
+    """?좏겙 ?꾩껜瑜??ㅻ줈 ?곕㈃ ?덈Т 湲몄뼱??SHA256 ?댁떆 ?ъ슜"""
     return f"auth:token:{hashlib.sha256(token.encode()).hexdigest()}"
 
 
 def verify_firebase_token(id_token: str) -> dict | None:
     """
-    Firebase ID 토큰 검증.
-    Redis 캐시 hit → 즉시 반환 (Firebase SDK 호출 없음)
-    Redis 캐시 miss → Firebase 검증 후 캐싱
+    Firebase ID ?좏겙 寃利?
+    Redis 罹먯떆 hit ??利됱떆 諛섑솚 (Firebase SDK ?몄텧 ?놁쓬)
+    Redis 罹먯떆 miss ??Firebase 寃利???罹먯떛
     """
     cache_key = _token_cache_key(id_token)
 
-    # 캐시 조회
+    # 罹먯떆 議고쉶
     cached = cache_get(cache_key)
     if cached is not None:
-        logger.info(f"[Auth] 토큰 캐시 hit uid={cached.get('uid')}")
+        logger.info(f"[Auth] ?좏겙 罹먯떆 hit uid={cached.get('uid')}")
         return cached
 
-    # Firebase 검증
-    try:
+    # Firebase 寃利?    try:
         decoded = firebase_auth.verify_id_token(id_token, check_revoked=True)
         payload = {
             "uid":   decoded["uid"],
@@ -83,38 +84,38 @@ def verify_firebase_token(id_token: str) -> dict | None:
             "exp":   decoded.get("exp", 0),
         }
         cache_set(cache_key, payload, TTL_FIREBASE_TOKEN)
-        logger.info(f"[Auth] Firebase 검증 성공, 캐시 저장 uid={payload['uid']}")
+        logger.info(f"[Auth] Firebase 寃利??깃났, 罹먯떆 ???uid={payload['uid']}")
         return payload
 
     except firebase_auth.RevokedIdTokenError:
-        logger.warning("[Auth] 폐기된 토큰")
+        logger.warning("[Auth] ?먭린???좏겙")
         return None
     except firebase_auth.InvalidIdTokenError as e:
-        logger.warning(f"[Auth] 유효하지 않은 토큰: {e}")
+        logger.warning(f"[Auth] ?좏슚?섏? ?딆? ?좏겙: {e}")
         return None
     except Exception as e:
-        logger.error(f"[Auth] Firebase 검증 오류: {e}")
+        logger.error(f"[Auth] Firebase 寃利??ㅻ쪟: {e}")
         return None
 
 
 def invalidate_token_cache(id_token: str):
-    """로그아웃 시 해당 토큰 캐시 삭제"""
+    """濡쒓렇?꾩썐 ???대떦 ?좏겙 罹먯떆 ??젣"""
     cache_delete(_token_cache_key(id_token))
-    logger.info("[Auth] 토큰 캐시 삭제 완료")
+    logger.info("[Auth] ?좏겙 罹먯떆 ??젣 ?꾨즺")
 
 
-# ── 유저 정보 조회 ────────────────────────────────────────────────────────────
+# ?? ?좎? ?뺣낫 議고쉶 ????????????????????????????????????????????????????????????
 
 def get_user_info(uid: str) -> dict | None:
     """
-    Firebase UID로 RDS 유저 정보 조회.
-    Redis 캐시 5분 → DB 조회 순서.
+    Firebase UID濡?RDS ?좎? ?뺣낫 議고쉶.
+    Redis 罹먯떆 5遺???DB 議고쉶 ?쒖꽌.
     """
     cache_key = f"auth:user:{uid}"
 
     cached = cache_get(cache_key)
     if cached is not None:
-        logger.info(f"[Auth] 유저 캐시 hit uid={uid}")
+        logger.info(f"[Auth] ?좎? 罹먯떆 hit uid={uid}")
         return cached
 
     db = get_db()
@@ -130,26 +131,26 @@ def get_user_info(uid: str) -> dict | None:
             user = cursor.fetchone()
 
         if user:
-            # datetime → str 변환 후 캐싱
+            # datetime ??str 蹂????罹먯떛
             user_data = {k: str(v) if hasattr(v, 'isoformat') else v for k, v in user.items()}
             cache_set(cache_key, user_data, TTL_USER_INFO)
-            logger.info(f"[Auth] DB 유저 조회 완료, 캐시 저장 uid={uid}")
+            logger.info(f"[Auth] DB ?좎? 議고쉶 ?꾨즺, 罹먯떆 ???uid={uid}")
             return user_data
         else:
-            logger.warning(f"[Auth] 유저 없음 uid={uid}")
+            logger.warning(f"[Auth] ?좎? ?놁쓬 uid={uid}")
             return None
 
     except Exception as e:
-        logger.error(f"[Auth] DB 조회 오류: {e}")
+        logger.error(f"[Auth] DB 議고쉶 ?ㅻ쪟: {e}")
         return None
 
 
 def invalidate_user_cache(uid: str):
-    """유저 정보 변경 시 캐시 무효화"""
+    """?좎? ?뺣낫 蹂寃???罹먯떆 臾댄슚??""
     cache_delete(f"auth:user:{uid}")
 
 
-# ── Lambda 핸들러 ──────────────────────────────────────────────────────────────
+# ?? Lambda ?몃뱾????????????????????????????????????????????????????????????????
 
 def lambda_handler(event: dict, context) -> dict:
     path   = event.get("path", "")
@@ -165,28 +166,28 @@ def lambda_handler(event: dict, context) -> dict:
 
 
 def _handle_verify(event: dict) -> dict:
-    """POST /auth/verify — 토큰 검증 + 유저 정보 반환"""
+    """POST /auth/verify ???좏겙 寃利?+ ?좎? ?뺣낫 諛섑솚"""
     headers = event.get("headers", {}) or {}
     auth_header = headers.get("Authorization", headers.get("authorization", ""))
 
     if not auth_header.startswith("Bearer "):
-        return _response(401, {"error": "Authorization 헤더 없음"})
+        return _response(401, {"error": "Authorization ?ㅻ뜑 ?놁쓬"})
 
-    id_token = auth_header[7:]  # "Bearer " 제거
+    id_token = auth_header[7:]  # "Bearer " ?쒓굅
 
     token_payload = verify_firebase_token(id_token)
     if not token_payload:
-        return _response(401, {"error": "유효하지 않은 토큰"})
+        return _response(401, {"error": "?좏슚?섏? ?딆? ?좏겙"})
 
     user = get_user_info(token_payload["uid"])
     if not user:
-        return _response(404, {"error": "유저 없음"})
+        return _response(404, {"error": "?좎? ?놁쓬"})
 
     return _response(200, {"user": user})
 
 
 def _handle_logout(event: dict) -> dict:
-    """POST /auth/logout — 캐시 삭제"""
+    """POST /auth/logout ??罹먯떆 ??젣"""
     headers = event.get("headers", {}) or {}
     auth_header = headers.get("Authorization", headers.get("authorization", ""))
 
@@ -199,7 +200,7 @@ def _handle_logout(event: dict) -> dict:
     if uid:
         invalidate_user_cache(uid)
 
-    return _response(200, {"message": "로그아웃 완료"})
+    return _response(200, {"message": "濡쒓렇?꾩썐 ?꾨즺"})
 
 
 def _response(status: int, body: dict) -> dict:
@@ -208,3 +209,4 @@ def _response(status: int, body: dict) -> dict:
         "headers": {"Content-Type": "application/json"},
         "body": json.dumps(body, ensure_ascii=False),
     }
+
