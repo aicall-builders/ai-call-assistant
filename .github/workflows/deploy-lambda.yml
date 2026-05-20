@@ -4,13 +4,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'lambda/auth_handler.py'
-      - 'lambda/call_handler.py'
-      - 'lambda/nlp_handler.py'
-      - 'lambda/keywords.json'
-      - 'lambda/requirements.txt'
-      - 'lambda/redis_client.py'
 
 jobs:
   deploy-auth:
@@ -109,7 +102,7 @@ jobs:
         id: check_nlp
         run: echo "changed=true" >> $GITHUB_OUTPUT
 
-        
+
       - name: Configure AWS credentials
         if: steps.check_nlp.outputs.changed == 'true'
         uses: aws-actions/configure-aws-credentials@v4
