@@ -1,16 +1,16 @@
 """
-call_handler.py — 중복 업로드 방지 with Redis SET NX
-변경점:
-  - S3 업로드 전 파일 해시로 중복 체크
-  - Redis SET NX 원자적 락 (10분 TTL)
-  - 중복 요청은 409 Conflict 반환
+call_handler.py — S3 업로드 + CLOVA STT 요청 + 폴링 메커니즘
 """
 import os
 import json
+import uuid
 import hashlib
 import logging
 import base64
 import boto3
+import pymysql
+import pymysql.cursors
+import requests
 from botocore.exceptions import ClientError
 
 from redis_client import set_nx_with_ttl, cache_get, cache_set, TTL_UPLOAD_LOCK
@@ -19,87 +19,327 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 s3 = boto3.client("s3")
-BUCKET_NAME = os.environ.get("S3_BUCKET", "call-recoder-audio-1017")
+BUCKET_NAME    = os.environ.get("S3_BUCKET", "call-recoder-audio-1017")
+
+CLOVA_API_URL  = os.environ.get("CLOVA_API_URL", "")
+CLOVA_SECRET   = os.environ.get("CLOVA_SECRET_KEY", "")
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+MAX_RETRY      = int(os.environ.get("STT_MAX_RETRY", 3))
+STALE_MINUTES  = int(os.environ.get("STT_STALE_MINUTES", 5))
+
+DB_CONFIG = {
+    "host":        os.environ.get("DB_HOST", "call-recorder-db.czem0u8m8xfi.ap-northeast-2.rds.amazonaws.com"),
+    "user":        os.environ.get("DB_USER", "admin"),
+    "password":    os.environ.get("DB_PASSWORD", ""),
+    "db":          os.environ.get("DB_NAME", "call_recorder"),
+    "charset":     "utf8mb4",
+    "cursorclass": pymysql.cursors.DictCursor,
+    "connect_timeout": 5,
+}
+
+
+# ── DB 연결 ───────────────────────────────────────────────────────────────────
+
+def get_db():
+    return pymysql.connect(**DB_CONFIG)
 
 
 # ── 중복 업로드 체크 ──────────────────────────────────────────────────────────
 
 def _file_hash(file_bytes: bytes) -> str:
-    """파일 내용 SHA256 해시 (중복 판별 키)"""
     return hashlib.sha256(file_bytes).hexdigest()
 
-
 def _upload_lock_key(user_id: str, file_hash: str) -> str:
-    """Redis 락 키: user별로 분리해서 다른 유저의 동일 파일은 허용"""
     return f"upload:lock:{user_id}:{file_hash}"
 
-
 def check_and_lock_upload(user_id: str, file_bytes: bytes) -> tuple[bool, str]:
-    """
-    업로드 중복 체크 + 락 획득.
-    반환: (is_duplicate, file_hash)
-      - is_duplicate=True  → 이미 처리 중이거나 최근 업로드된 파일
-      - is_duplicate=False → 정상 진행 가능
-    """
-    fhash = _file_hash(file_bytes)
+    fhash    = _file_hash(file_bytes)
     lock_key = _upload_lock_key(user_id, fhash)
-
     acquired = set_nx_with_ttl(lock_key, user_id, TTL_UPLOAD_LOCK)
     if not acquired:
-        logger.warning(f"[Call] 중복 업로드 감지 user={user_id} hash={fhash[:16]}...")
+        logger.warning(f"[Call] 중복 업로드 감지 user={user_id} hash={fhash[:16]}")
         return True, fhash
-
-    logger.info(f"[Call] 업로드 락 획득 user={user_id} hash={fhash[:16]}...")
     return False, fhash
 
 
 # ── S3 업로드 ─────────────────────────────────────────────────────────────────
 
 def upload_to_s3(user_id: str, file_bytes: bytes, filename: str, file_hash: str) -> str:
-    """S3에 오디오 파일 업로드 후 object key 반환"""
-    # 파일명에 해시 포함 → 동일 파일 재업로드 방지 + 디버깅 편의
-    ext = os.path.splitext(filename)[-1].lower() or ".wav"
+    ext    = os.path.splitext(filename)[-1].lower() or ".wav"
     s3_key = f"audio/{user_id}/{file_hash[:16]}{ext}"
-
-    try:
-        s3.put_object(
-            Bucket=BUCKET_NAME,
-            Key=s3_key,
-            Body=file_bytes,
-            ContentType=_content_type(ext),
-            Metadata={
-                "user_id":   user_id,
-                "file_hash": file_hash,
-                "original_filename": filename,
-            },
-        )
-        logger.info(f"[Call] S3 업로드 완료 key={s3_key}")
-
-        # 업로드 결과도 짧게 캐싱 (동일 해시로 재요청 시 S3 키 즉시 반환용)
-        cache_set(f"upload:result:{user_id}:{file_hash}", {"s3_key": s3_key}, TTL_UPLOAD_LOCK)
-        return s3_key
-
-    except ClientError as e:
-        logger.error(f"[Call] S3 업로드 실패: {e}")
-        raise
-
+    s3.put_object(
+        Bucket=BUCKET_NAME, Key=s3_key, Body=file_bytes,
+        ContentType=_content_type(ext),
+        Metadata={"user_id": user_id, "file_hash": file_hash, "original_filename": filename},
+    )
+    logger.info(f"[Call] S3 업로드 완료 key={s3_key}")
+    cache_set(f"upload:result:{user_id}:{file_hash}", {"s3_key": s3_key}, TTL_UPLOAD_LOCK)
+    return s3_key
 
 def _content_type(ext: str) -> str:
     return {
-        ".wav":  "audio/wav",
-        ".mp3":  "audio/mpeg",
-        ".m4a":  "audio/mp4",
-        ".ogg":  "audio/ogg",
-        ".flac": "audio/flac",
-        ".webm": "audio/webm",
+        ".wav": "audio/wav", ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4", ".ogg": "audio/ogg",
+        ".flac": "audio/flac", ".webm": "audio/webm",
     }.get(ext, "application/octet-stream")
 
 
-# ── Lambda 핸들러 ──────────────────────────────────────────────────────────────
+# ── calls 테이블 INSERT ───────────────────────────────────────────────────────
+
+def insert_call(user_id: str, store_id: str, s3_key: str,
+                caller_number: str = "", duration: int = 0) -> str:
+    call_id = str(uuid.uuid4())
+    sql = """
+        INSERT INTO calls
+            (id, store_id, user_id, caller_number, s3_key, status)
+        VALUES
+            (%s, %s, %s, %s, %s, 'uploaded')
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (call_id, store_id, user_id, caller_number, s3_key))
+        conn.commit()
+    logger.info(f"[Call] calls INSERT call_id={call_id}")
+    return call_id
+
+
+# ── CLOVA STT 비동기 요청 ─────────────────────────────────────────────────────
+
+def request_clova_stt(call_id: str, s3_key: str) -> str | None:
+    """
+    CLOVA Async STT 요청 → clova_job_id 반환.
+    성공 시 calls.status = 'processing', clova_job_id 저장.
+    """
+    # S3 presigned URL 생성 (CLOVA가 직접 다운로드)
+    presigned_url = s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": BUCKET_NAME, "Key": s3_key},
+        ExpiresIn=3600,
+    )
+
+    headers = {
+        "Accept":               "application/json",
+        "X-CLOVASPEECH-API-KEY": CLOVA_SECRET,
+        "Content-Type":         "application/json",
+    }
+    body = {
+        "url":      presigned_url,
+        "language": "ko-KR",
+        "completion": "async",
+    }
+
+    try:
+        resp = requests.post(
+            f"{CLOVA_API_URL}/recognizer/url",
+            headers=headers, json=body, timeout=10,
+        )
+        resp.raise_for_status()
+        job_id = resp.json().get("token")
+        if not job_id:
+            raise ValueError(f"CLOVA 응답에 token 없음: {resp.text}")
+
+        # DB 업데이트
+        _update_call_status(call_id, status="processing", clova_job_id=job_id)
+        logger.info(f"[CLOVA] STT 요청 완료 call_id={call_id} job_id={job_id}")
+        return job_id
+
+    except Exception as e:
+        logger.error(f"[CLOVA] STT 요청 실패 call_id={call_id}: {e}")
+        _update_call_status(call_id, status="error", error_message=str(e))
+        return None
+
+
+# ════════════════════════════════════════════════════════════
+# 폴링 메커니즘 — EventBridge 5분 주기로 호출
+# ════════════════════════════════════════════════════════════
+
+def check_pending_stt(event=None, context=None):
+    """
+    status='processing' 이고 updated_at이 STALE_MINUTES분 이상 지난 통화 조회.
+    retry_count < MAX_RETRY → CLOVA 재조회
+    retry_count >= MAX_RETRY → Whisper fallback
+    """
+    logger.info("[Polling] check_pending_stt 시작")
+    pending = _query_pending_calls()
+    logger.info(f"[Polling] 대상 {len(pending)}건")
+
+    result = {"total": len(pending), "clova_ok": 0, "whisper_ok": 0, "failed": 0}
+
+    for call in pending:
+        call_id     = call["id"]
+        retry_count = call["retry_count"] or 0
+        clova_job   = call.get("clova_job_id")
+
+        try:
+            if retry_count < MAX_RETRY and clova_job:
+                ok = _poll_clova(call_id, clova_job, retry_count)
+                if ok:
+                    result["clova_ok"] += 1
+                else:
+                    result["failed"] += 1
+            else:
+                ok = _run_whisper_fallback(call_id, call.get("s3_key"))
+                if ok:
+                    result["whisper_ok"] += 1
+                else:
+                    result["failed"] += 1
+
+        except Exception as e:
+            logger.error(f"[Polling] call_id={call_id} 오류: {e}", exc_info=True)
+            _update_call_status(call_id, status="error", error_message=str(e))
+            result["failed"] += 1
+
+    logger.info(f"[Polling] 완료: {result}")
+    return {"statusCode": 200, "body": json.dumps(result, ensure_ascii=False)}
+
+
+def _query_pending_calls() -> list[dict]:
+    sql = """
+        SELECT id, clova_job_id, s3_key, retry_count, updated_at
+        FROM calls
+        WHERE
+            status = 'processing'
+            AND updated_at < NOW() - INTERVAL %s MINUTE
+        ORDER BY updated_at ASC
+        LIMIT 50
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (STALE_MINUTES,))
+            return cur.fetchall()
+
+
+# ── CLOVA 재조회 ──────────────────────────────────────────────────────────────
+
+def _poll_clova(call_id: str, job_id: str, retry_count: int) -> bool:
+    logger.info(f"[CLOVA] 재조회 call_id={call_id} job_id={job_id} retry={retry_count}")
+    try:
+        headers = {
+            "Accept":                "application/json",
+            "X-CLOVASPEECH-API-KEY": CLOVA_SECRET,
+        }
+        resp = requests.get(
+            f"{CLOVA_API_URL}/recognizer/upload/{job_id}",
+            headers=headers, timeout=10,
+        )
+        resp.raise_for_status()
+        data   = resp.json()
+        status = data.get("status", "").lower()
+
+        if status == "completed":
+            transcript = _extract_transcript(data)
+            _update_call_status(call_id, status="transcribed", stt_result=transcript)
+            logger.info(f"[CLOVA] 완료 call_id={call_id}")
+            return True
+
+        elif status in ("failed", "error"):
+            logger.warning(f"[CLOVA] 실패 → Whisper로 전환 call_id={call_id}")
+            # retry_count를 MAX_RETRY로 올려서 다음 폴링에서 Whisper 분기
+            _increment_retry(call_id, force_max=True)
+            return False
+
+        else:
+            # 아직 진행 중
+            _increment_retry(call_id, retry_count=retry_count)
+            logger.info(f"[CLOVA] 진행중 call_id={call_id} status={status}")
+            return False
+
+    except Exception as e:
+        logger.error(f"[CLOVA] 재조회 오류 call_id={call_id}: {e}")
+        _increment_retry(call_id, retry_count=retry_count)
+        return False
+
+
+def _extract_transcript(data: dict) -> str:
+    segments = data.get("segments", [])
+    if segments:
+        return " ".join(seg.get("text", "") for seg in segments).strip()
+    return data.get("text", "")
+
+
+# ── Whisper fallback ──────────────────────────────────────────────────────────
+
+def _run_whisper_fallback(call_id: str, s3_key: str | None) -> bool:
+    logger.info(f"[Whisper] fallback 시작 call_id={call_id} s3_key={s3_key}")
+
+    if not s3_key:
+        logger.error(f"[Whisper] s3_key 없음 call_id={call_id}")
+        _update_call_status(call_id, status="error", error_message="s3_key missing")
+        return False
+
+    try:
+        import openai
+        openai.api_key = OPENAI_API_KEY
+
+        obj        = s3.get_object(Bucket=BUCKET_NAME, Key=s3_key)
+        audio_bytes = obj["Body"].read()
+        filename   = s3_key.split("/")[-1]
+
+        response = openai.audio.transcriptions.create(
+            model="whisper-1",
+            file=(filename, audio_bytes, _content_type(os.path.splitext(filename)[-1])),
+            language="ko",
+            response_format="text",
+        )
+        transcript = response.strip() if isinstance(response, str) else response.text.strip()
+        _update_call_status(call_id, status="transcribed", stt_result=transcript)
+        logger.info(f"[Whisper] 완료 call_id={call_id} chars={len(transcript)}")
+        return True
+
+    except Exception as e:
+        logger.error(f"[Whisper] 오류 call_id={call_id}: {e}")
+        _update_call_status(call_id, status="error", error_message=f"whisper: {e}")
+        return False
+
+
+# ── DB 업데이트 헬퍼 ──────────────────────────────────────────────────────────
+
+def _update_call_status(call_id: str, *, status: str,
+                         clova_job_id: str = None,
+                         stt_result: str = None,
+                         error_message: str = None) -> None:
+    fields = ["status = %s", "updated_at = NOW()"]
+    values = [status]
+
+    if clova_job_id is not None:
+        fields.append("clova_job_id = %s")
+        values.append(clova_job_id)
+    if stt_result is not None:
+        fields.append("stt_result = %s")
+        values.append(stt_result)
+    if error_message is not None:
+        fields.append("error_message = %s")
+        values.append(error_message)
+
+    values.append(call_id)
+    sql = f"UPDATE calls SET {', '.join(fields)} WHERE id = %s"
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, values)
+        conn.commit()
+
+
+def _increment_retry(call_id: str, retry_count: int = 0, force_max: bool = False) -> None:
+    new_count = MAX_RETRY if force_max else retry_count + 1
+    sql = "UPDATE calls SET retry_count = %s, updated_at = NOW() WHERE id = %s"
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (new_count, call_id))
+        conn.commit()
+
+
+# ── Lambda 핸들러 ─────────────────────────────────────────────────────────────
 
 def lambda_handler(event: dict, context) -> dict:
     path   = event.get("path", "")
     method = event.get("httpMethod", "POST")
+
+    # EventBridge Scheduled Rule (폴링)
+    if event.get("source") == "aws.events":
+        return check_pending_stt(event, context)
 
     if path == "/call/upload" and method == "POST":
         return _handle_upload(event)
@@ -108,23 +348,20 @@ def lambda_handler(event: dict, context) -> dict:
 
 
 def _handle_upload(event: dict) -> dict:
-    """
-    POST /call/upload
-    Body: multipart 또는 base64 JSON { "file": "<base64>", "filename": "...", "user_id": "..." }
-    """
     try:
-        body = json.loads(event.get("body") or "{}")
-
+        body     = json.loads(event.get("body") or "{}")
         user_id  = body.get("user_id", "").strip()
+        store_id = body.get("store_id", "").strip()
         filename = body.get("filename", "recording.wav").strip()
         file_b64 = body.get("file", "")
 
         if not user_id:
             return _response(400, {"error": "user_id 필수"})
+        if not store_id:
+            return _response(400, {"error": "store_id 필수"})
         if not file_b64:
             return _response(400, {"error": "file(base64) 필수"})
 
-        # base64 디코딩
         try:
             file_bytes = base64.b64decode(file_b64)
         except Exception:
@@ -133,31 +370,39 @@ def _handle_upload(event: dict) -> dict:
         if len(file_bytes) == 0:
             return _response(400, {"error": "빈 파일"})
 
-        # 최대 파일 크기 체크 (100MB)
         MAX_SIZE = 100 * 1024 * 1024
         if len(file_bytes) > MAX_SIZE:
-            return _response(413, {"error": f"파일 크기 초과 (최대 {MAX_SIZE // 1024 // 1024}MB)"})
+            return _response(413, {"error": f"파일 크기 초과 (최대 {MAX_SIZE//1024//1024}MB)"})
 
-        # ── 핵심: 중복 업로드 체크 ──────────────────────────────────────────
+        # 중복 체크
         is_duplicate, file_hash = check_and_lock_upload(user_id, file_bytes)
-
         if is_duplicate:
-            # 이미 처리된 결과가 캐시에 있으면 그것도 같이 반환
-            cached_result = cache_get(f"upload:result:{user_id}:{file_hash}")
+            cached = cache_get(f"upload:result:{user_id}:{file_hash}")
             return _response(409, {
-                "error": "중복 업로드: 동일한 파일이 이미 업로드되었거나 처리 중입니다",
+                "error": "중복 업로드",
                 "file_hash": file_hash[:16],
-                "previous_result": cached_result,  # None이면 처리 중
+                "previous_result": cached,
             })
 
-        # ── S3 업로드 ────────────────────────────────────────────────────────
+        # S3 업로드
         s3_key = upload_to_s3(user_id, file_bytes, filename, file_hash)
 
+        # calls 테이블 INSERT
+        call_id = insert_call(
+            user_id=user_id, store_id=store_id,
+            s3_key=s3_key,
+            caller_number=body.get("caller_number", ""),
+        )
+
+        # CLOVA STT 비동기 요청
+        job_id = request_clova_stt(call_id, s3_key)
+
         return _response(200, {
-            "message": "업로드 성공",
-            "s3_key":  s3_key,
-            "file_hash": file_hash[:16],
-            "size_bytes": len(file_bytes),
+            "message": "업로드 및 STT 요청 완료",
+            "call_id":   call_id,
+            "s3_key":    s3_key,
+            "clova_job_id": job_id,
+            "status":    "processing" if job_id else "error",
         })
 
     except ClientError as e:
