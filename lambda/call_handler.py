@@ -368,17 +368,229 @@ def _increment_retry(call_id: str, retry_count: int = 0, force_max: bool = False
 
 def lambda_handler(event: dict, context) -> dict:
     path   = event.get("path", "")
-    method = event.get("httpMethod", "POST")
+    method = event.get("httpMethod", "GET")
 
-    # EventBridge Scheduled Rule (폴링)
     if event.get("source") == "aws.events":
         return check_pending_stt(event, context)
 
-    if path == "/call/upload" and method == "POST":
+    if method == "OPTIONS":
+        return _response(200, {})
+
+    # stores
+    if path == "/stores" and method == "GET":
+        return _handle_stores_list(event)
+    if path == "/stores" and method == "POST":
+        return _handle_stores_create(event)
+
+    # calls
+    if path == "/calls" and method == "GET":
+        return _handle_calls_list(event)
+    if path and path.startswith("/calls/") and path.endswith("/audio") and method == "GET":
+        call_id = path.split("/")[2]
+        return _handle_call_audio(event, call_id)
+    if path and path.startswith("/calls/") and path.endswith("/process") and method == "POST":
+        call_id = path.split("/")[2]
+        return _handle_call_process(event, call_id)
+    if path and path.startswith("/calls/") and method == "GET":
+        call_id = path.split("/")[2]
+        return _handle_call_get(event, call_id)
+    if path and path.startswith("/calls/") and method == "PATCH":
+        call_id = path.split("/")[2]
+        return _handle_call_patch(event, call_id)
+    if path and path.startswith("/calls/") and method == "DELETE":
+        call_id = path.split("/")[2]
+        return _handle_call_delete(event, call_id)
+    if path == "/calls/upload" and method == "POST":
         return _handle_upload(event)
 
     return _response(404, {"error": "Not found"})
 
+def _get_uid(event: dict) -> str | None:
+    """Authorization 헤더에서 uid 추출 (Firebase ID Token 검증 생략, uid만 파싱)"""
+    headers = event.get("headers", {}) or {}
+    auth = headers.get("Authorization", headers.get("authorization", ""))
+    if not auth.startswith("Bearer "):
+        return None
+    # Firebase ID Token에서 uid 추출 (검증은 auth_handler에서 담당)
+    try:
+        import base64 as b64
+        token = auth[7:]
+        parts = token.split(".")
+        padded = parts[1] + "=" * (4 - len(parts[1]) % 4)
+        payload = json.loads(b64.urlsafe_b64decode(padded))
+        return payload.get("user_id") or payload.get("sub")
+    except Exception:
+        return None
+
+
+def _handle_stores_list(event: dict) -> dict:
+    uid = _get_uid(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"})
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, name, owner_id, created_at FROM stores WHERE owner_id = %s",
+                    (uid,)
+                )
+                stores = cur.fetchall()
+        result = [{k: str(v) if hasattr(v, "isoformat") else v for k, v in s.items()} for s in stores]
+        return _response(200, {"stores": result})
+    except Exception as e:
+        logger.exception(f"[Store] list 오류: {e}")
+        return _response(500, {"error": "내부 오류"})
+
+
+def _handle_stores_create(event: dict) -> dict:
+    uid = _get_uid(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"})
+    try:
+        body = json.loads(event.get("body") or "{}")
+        name = body.get("name", "").strip()
+        if not name:
+            return _response(400, {"error": "name 필수"})
+        store_id = str(uuid.uuid4())
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO stores (id, name, owner_id) VALUES (%s, %s, %s)",
+                    (store_id, name, uid)
+                )
+            conn.commit()
+        return _response(201, {"id": store_id, "name": name, "owner_id": uid})
+    except Exception as e:
+        logger.exception(f"[Store] create 오류: {e}")
+        return _response(500, {"error": "내부 오류"})
+
+
+def _handle_calls_list(event: dict) -> dict:
+    uid = _get_uid(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"})
+    try:
+        params = event.get("queryStringParameters") or {}
+        store_id = params.get("store_id")
+        status   = params.get("status")
+        limit    = int(params.get("limit", 20))
+        offset   = int(params.get("offset", 0))
+
+        sql = "SELECT * FROM calls WHERE user_id = %s"
+        values = [uid]
+        if store_id:
+            sql += " AND store_id = %s"
+            values.append(store_id)
+        if status:
+            sql += " AND status = %s"
+            values.append(status)
+        sql += " ORDER BY created_at DESC LIMIT %s OFFSET %s"
+        values += [limit, offset]
+
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, values)
+                calls = cur.fetchall()
+        result = [{k: str(v) if hasattr(v, "isoformat") else v for k, v in c.items()} for c in calls]
+        return _response(200, {"calls": result})
+    except Exception as e:
+        logger.exception(f"[Call] list 오류: {e}")
+        return _response(500, {"error": "내부 오류"})
+
+
+def _handle_call_get(event: dict, call_id: str) -> dict:
+    uid = _get_uid(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"})
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM calls WHERE id = %s AND user_id = %s", (call_id, uid))
+                call = cur.fetchone()
+        if not call:
+            return _response(404, {"error": "통화를 찾을 수 없습니다"})
+        result = {k: str(v) if hasattr(v, "isoformat") else v for k, v in call.items()}
+        return _response(200, {"call": result})
+    except Exception as e:
+        logger.exception(f"[Call] get 오류: {e}")
+        return _response(500, {"error": "내부 오류"})
+
+
+def _handle_call_patch(event: dict, call_id: str) -> dict:
+    uid = _get_uid(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"})
+    try:
+        body = json.loads(event.get("body") or "{}")
+        caller_category = body.get("caller_category", "").strip()
+        if caller_category not in ("BUSINESS", "PERSONAL", "UNCLASSIFIED"):
+            return _response(400, {"error": "유효하지 않은 category"})
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE calls SET caller_category = %s WHERE id = %s AND user_id = %s",
+                    (caller_category, call_id, uid)
+                )
+            conn.commit()
+        return _response(200, {"message": "업데이트 완료"})
+    except Exception as e:
+        logger.exception(f"[Call] patch 오류: {e}")
+        return _response(500, {"error": "내부 오류"})
+
+
+def _handle_call_delete(event: dict, call_id: str) -> dict:
+    uid = _get_uid(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"})
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM calls WHERE id = %s AND user_id = %s", (call_id, uid))
+            conn.commit()
+        return _response(200, {"message": "삭제 완료"})
+    except Exception as e:
+        logger.exception(f"[Call] delete 오류: {e}")
+        return _response(500, {"error": "내부 오류"})
+
+
+def _handle_call_audio(event: dict, call_id: str) -> dict:
+    uid = _get_uid(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"})
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT s3_key FROM calls WHERE id = %s AND user_id = %s", (call_id, uid))
+                call = cur.fetchone()
+        if not call:
+            return _response(404, {"error": "통화를 찾을 수 없습니다"})
+        url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": BUCKET_NAME, "Key": call["s3_key"]},
+            ExpiresIn=600,
+        )
+        return _response(200, {"url": url})
+    except Exception as e:
+        logger.exception(f"[Call] audio 오류: {e}")
+        return _response(500, {"error": "내부 오류"})
+
+
+def _handle_call_process(event: dict, call_id: str) -> dict:
+    uid = _get_uid(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"})
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT s3_key FROM calls WHERE id = %s AND user_id = %s", (call_id, uid))
+                call = cur.fetchone()
+        if not call:
+            return _response(404, {"error": "통화를 찾을 수 없습니다"})
+        job_id = request_clova_stt(call_id, call["s3_key"])
+        return _response(200, {"message": "STT 처리 시작", "clova_job_id": job_id})
+    except Exception as e:
+        logger.exception(f"[Call] process 오류: {e}")
+        return _response(500, {"error": "내부 오류"})
 
 def _handle_upload(event: dict) -> dict:
     try:
@@ -448,6 +660,11 @@ def _handle_upload(event: dict) -> dict:
 def _response(status: int, body: dict) -> dict:
     return {
         "statusCode": status,
-        "headers": {"Content-Type": "application/json"},
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "https://dk1k75g0ji3vw.cloudfront.net",
+            "Access-Control-Allow-Headers": "Content-Type,Authorization",
+            "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
+        },
         "body": json.dumps(body, ensure_ascii=False),
     }
