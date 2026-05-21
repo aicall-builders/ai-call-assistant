@@ -118,11 +118,67 @@ def invalidate_user_cache(uid: str):
 def lambda_handler(event: dict, context) -> dict:
     path = event.get("path", "")
     method = event.get("httpMethod", "POST")
+    if method == "OPTIONS":
+        return _response(200, {})
+    if path == "/auth/kakao" and method == "POST":
+        return _handle_kakao(event)
     if path == "/auth/logout" and method == "POST":
         return _handle_logout(event)
     if path == "/auth/verify" and method == "POST":
         return _handle_verify(event)
     return _response(404, {"error": "Not found"})
+
+def _handle_kakao(event: dict) -> dict:
+    try:
+        body = json.loads(event.get("body") or "{}")
+        kakao_access_token = body.get("access_token", "").strip()
+        if not kakao_access_token:
+            return _response(400, {"error": "access_token 필수"})
+
+        import requests as req
+        kakao_resp = req.get(
+            "https://kapi.kakao.com/v2/user/me",
+            headers={"Authorization": f"Bearer {kakao_access_token}"},
+            timeout=5,
+        )
+        if kakao_resp.status_code != 200:
+            return _response(401, {"error": "카카오 토큰 검증 실패"})
+
+        kakao_user    = kakao_resp.json()
+        kakao_id      = str(kakao_user["id"])
+        kakao_account = kakao_user.get("kakao_account", {})
+        email         = kakao_account.get("email", f"{kakao_id}@kakao.com")
+        nickname      = kakao_account.get("profile", {}).get("nickname", "")
+        uid           = f"kakao:{kakao_id}"
+
+        custom_token = firebase_auth.create_custom_token(uid)
+        custom_token_str = custom_token.decode("utf-8") if isinstance(custom_token, bytes) else custom_token
+
+        db = get_db()
+        if db:
+            try:
+                with db.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO users (id, uid, email, name, plan)
+                        VALUES (UUID(), %s, %s, %s, 'free')
+                        ON DUPLICATE KEY UPDATE
+                            email = VALUES(email),
+                            name  = VALUES(name)
+                    """, (uid, email, nickname))
+                db.commit()
+            except Exception as e:
+                logger.error(f"[Auth] DB upsert 실패: {e}")
+
+        invalidate_user_cache(uid)
+        return _response(200, {
+            "custom_token": custom_token_str,
+            "uid": uid,
+            "email": email,
+            "name": nickname,
+        })
+    except Exception as e:
+        logger.exception(f"[Auth] kakao 처리 오류: {e}")
+        return _response(500, {"error": "내부 오류"})
 
 
 def _handle_verify(event: dict) -> dict:
@@ -155,6 +211,11 @@ def _handle_logout(event: dict) -> dict:
 def _response(status: int, body: dict) -> dict:
     return {
         "statusCode": status,
-        "headers": {"Content-Type": "application/json"},
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "https://dk1k75g0ji3vw.cloudfront.net",
+            "Access-Control-Allow-Headers": "Content-Type,Authorization",
+            "Access-Control-Allow-Methods": "POST,OPTIONS",
+        },
         "body": json.dumps(body, ensure_ascii=False),
     }
