@@ -23,25 +23,32 @@ if not firebase_admin._apps:
     cred = credentials.Certificate(json.loads(sa_json))
     firebase_admin.initialize_app(cred)
 
-DB_CONFIG = {
-    "host": os.environ.get("DB_HOST", "call-recorder-db.czem0u8m8xfi.ap-northeast-2.rds.amazonaws.com"),
-    "user": os.environ.get("DB_USER", ""),
-    "password": os.environ.get("DB_PASSWORD", ""),
-    "db": os.environ.get("DB_NAME", "call_recorder"),
-    "charset": "utf8mb4",
-    "cursorclass": pymysql.cursors.DictCursor,
-    "connect_timeout": 5,
-}
+import boto3 as _boto3
 
-_db_conn = None
-
+def _get_db_password() -> str:
+    secret_name = os.environ.get("DB_SECRET_NAME", "")
+    if secret_name:
+        try:
+            sm = _boto3.client("secretsmanager", region_name="ap-northeast-2")
+            secret = sm.get_secret_value(SecretId=secret_name)
+            data = json.loads(secret["SecretString"])
+            return data.get("password") or data.get("db_password", "")
+        except Exception as e:
+            logger.error(f"[DB] Secrets Manager 조회 실패: {e}")
+    return os.environ.get("DB_PASSWORD", "")
 
 def get_db():
-    global _db_conn
     try:
-        if _db_conn is None or not _db_conn.open:
-            _db_conn = pymysql.connect(**DB_CONFIG)
-        return _db_conn
+        conn = pymysql.connect(
+            host=os.environ.get("DB_HOST", "call-recorder-db.czem0u8m8xfi.ap-northeast-2.rds.amazonaws.com"),
+            user=os.environ.get("DB_USER", "admin"),
+            password=_get_db_password(),
+            db=os.environ.get("DB_NAME", "call_recorder"),
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor,
+            connect_timeout=5,
+        )
+        return conn
     except Exception as e:
         logger.error(f"[Auth] DB connection failed: {e}")
         return None
