@@ -260,16 +260,18 @@ Lambda 환경변수에는 **식별자 성격의 값**만 두고, 비밀은 Secre
 | API 서버 가용성 (월) | ≥ 99.5% |
 
 ---
+## ✅ Phase 1 추가 완료
+- Redis 캐싱 — keywords 핫리로드 102ms → 5ms (20배 개선)
+- Firebase 토큰 캐싱 + 중복 업로드 방지 (SET NX 락)
+- CloudWatch + Slack 알림 연동
+- CLOVA Webhook 폴링 메커니즘 (5분 주기 자동 복구)
 
 ## 📈 향후 로드맵 (Phase 2)
-
 - GitHub Actions 기반 자동 배포 파이프라인
 - 단위 테스트 추가
-- Redis 캐시 연결 (키워드 룰셋 핫리로드)
-- Grafana + Slack 알림 연동
-- LLM 호출 PII 마스킹 (전화번호·이름 토큰화)
-- CLOVA Webhook 재시도 메커니즘
-
+- Grafana 대시보드
+- LLM 호출 PII 마스킹
+- 삼성 권한 다중화
 ---
 
 ## 🔗 관련 저장소
