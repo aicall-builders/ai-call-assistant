@@ -406,20 +406,30 @@ def lambda_handler(event: dict, context) -> dict:
     return _response(404, {"error": "Not found"})
 
 def _get_uid(event: dict) -> str | None:
-    """Authorization 헤더에서 uid 추출 (Firebase ID Token 검증 생략, uid만 파싱)"""
     headers = event.get("headers", {}) or {}
     auth = headers.get("Authorization", headers.get("authorization", ""))
     if not auth.startswith("Bearer "):
         return None
-    # Firebase ID Token에서 uid 추출 (검증은 auth_handler에서 담당)
     try:
         import base64 as b64
         token = auth[7:]
         parts = token.split(".")
         padded = parts[1] + "=" * (4 - len(parts[1]) % 4)
         payload = json.loads(b64.urlsafe_b64decode(padded))
-        return payload.get("user_id") or payload.get("sub")
-    except Exception:
+        firebase_uid = payload.get("user_id") or payload.get("sub")
+        if not firebase_uid:
+            return None
+        # firebase_uid로 users.id(UUID) 조회
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM users WHERE firebase_uid = %s LIMIT 1",
+                    (firebase_uid,)
+                )
+                user = cur.fetchone()
+        return user["id"] if user else None
+    except Exception as e:
+        logger.error(f"[Call] _get_uid 오류: {e}")
         return None
 
 

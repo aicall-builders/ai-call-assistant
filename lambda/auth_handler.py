@@ -130,7 +130,7 @@ def lambda_handler(event: dict, context) -> dict:
 
 def _handle_kakao(event: dict) -> dict:
     try:
-        body = json.loads(event.get("body") or "{}")
+        body     = json.loads(event.get("body") or "{}")
         kakao_id = str(body.get("kakao_id", "")).strip()
         email    = body.get("email", "")
         nickname = body.get("nickname", "")
@@ -138,29 +138,44 @@ def _handle_kakao(event: dict) -> dict:
         if not kakao_id:
             return _response(400, {"error": "kakao_id 필수"})
 
-        uid = f"kakao:{kakao_id}"
-        custom_token = firebase_auth.create_custom_token(uid)
+        firebase_uid = f"kakao:{kakao_id}"
+        custom_token = firebase_auth.create_custom_token(firebase_uid)
         custom_token_str = custom_token.decode("utf-8") if isinstance(custom_token, bytes) else custom_token
 
         db = get_db()
+        user_uuid = None
         if db:
             try:
                 with db.cursor() as cursor:
-                    cursor.execute("""
-                        INSERT INTO users (id, uid, email, name, plan)
-                        VALUES (UUID(), %s, %s, %s, 'free')
-                        ON DUPLICATE KEY UPDATE
-                            email = VALUES(email),
-                            name  = VALUES(name)
-                    """, (uid, email, nickname))
+                    # 기존 유저 조회
+                    cursor.execute(
+                        "SELECT id FROM users WHERE kakao_id = %s LIMIT 1",
+                        (kakao_id,)
+                    )
+                    user = cursor.fetchone()
+                    if user:
+                        user_uuid = user["id"]
+                        # firebase_uid 업데이트
+                        cursor.execute(
+                            "UPDATE users SET firebase_uid = %s WHERE id = %s",
+                            (firebase_uid, user_uuid)
+                        )
+                    else:
+                        # 신규 유저 생성
+                        user_uuid = str(__import__("uuid").uuid4())
+                        cursor.execute("""
+                            INSERT INTO users (id, firebase_uid, kakao_id, name, role)
+                            VALUES (%s, %s, %s, %s, 'OWNER')
+                        """, (user_uuid, firebase_uid, kakao_id, nickname))
                 db.commit()
             except Exception as e:
                 logger.error(f"[Auth] DB upsert 실패: {e}")
 
-        invalidate_user_cache(uid)
+        invalidate_user_cache(firebase_uid)
         return _response(200, {
             "custom_token": custom_token_str,
-            "uid": uid,
+            "uid": firebase_uid,
+            "user_uuid": user_uuid,
             "email": email,
             "name": nickname,
         })
