@@ -593,67 +593,48 @@ def _handle_call_process(event: dict, call_id: str) -> dict:
         return _response(500, {"error": "내부 오류"})
 
 def _handle_upload(event: dict) -> dict:
+    uid = _get_uid(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"})
     try:
-        body     = json.loads(event.get("body") or "{}")
-        user_id  = body.get("user_id", "").strip()
-        store_id = body.get("store_id", "").strip()
-        filename = body.get("filename", "recording.wav").strip()
-        file_b64 = body.get("file", "")
+        body        = json.loads(event.get("body") or "{}")
+        store_id    = body.get("store_id", "").strip()
+        file_name   = body.get("file_name", "recording.m4a").strip()
+        mime_type   = body.get("mime_type", "audio/mp4").strip()
 
-        if not user_id:
-            return _response(400, {"error": "user_id 필수"})
         if not store_id:
             return _response(400, {"error": "store_id 필수"})
-        if not file_b64:
-            return _response(400, {"error": "file(base64) 필수"})
 
-        try:
-            file_bytes = base64.b64decode(file_b64)
-        except Exception:
-            return _response(400, {"error": "file base64 디코딩 실패"})
+        call_id = str(uuid.uuid4())
+        s3_key  = f"recordings/{store_id}/{call_id}/{file_name}"
 
-        if len(file_bytes) == 0:
-            return _response(400, {"error": "빈 파일"})
-
-        MAX_SIZE = 100 * 1024 * 1024
-        if len(file_bytes) > MAX_SIZE:
-            return _response(413, {"error": f"파일 크기 초과 (최대 {MAX_SIZE//1024//1024}MB)"})
-
-        # 중복 체크
-        is_duplicate, file_hash = check_and_lock_upload(user_id, file_bytes)
-        if is_duplicate:
-            cached = cache_get(f"upload:result:{user_id}:{file_hash}")
-            return _response(409, {
-                "error": "중복 업로드",
-                "file_hash": file_hash[:16],
-                "previous_result": cached,
-            })
-
-        # S3 업로드
-        s3_key = upload_to_s3(user_id, file_bytes, filename, file_hash)
-
-        # calls 테이블 INSERT
-        call_id = insert_call(
-            user_id=user_id, store_id=store_id,
-            s3_key=s3_key,
-            caller_number=body.get("caller_number", ""),
+        upload_url = s3.generate_presigned_url(
+            "put_object",
+            Params={
+                "Bucket": BUCKET_NAME,
+                "Key": s3_key,
+                "ContentType": mime_type,
+            },
+            ExpiresIn=600,
         )
 
-        # CLOVA STT 비동기 요청
-        job_id = request_clova_stt(call_id, s3_key)
+        sql = """
+            INSERT INTO calls (id, store_id, user_id, s3_key, status)
+            VALUES (%s, %s, %s, %s, 'uploaded')
+        """
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (call_id, store_id, uid, s3_key))
+            conn.commit()
 
         return _response(200, {
-            "message": "업로드 및 STT 요청 완료",
-            "call_id":   call_id,
-            "s3_key":    s3_key,
-            "clova_job_id": job_id,
-            "status":    "processing" if job_id else "error",
+            "call_id": call_id,
+            "upload_url": upload_url,
+            "s3_key": s3_key,
         })
 
-    except ClientError as e:
-        return _response(502, {"error": f"S3 오류: {str(e)}"})
     except Exception as e:
-        logger.exception(f"[Call] 처리 오류: {e}")
+        logger.exception(f"[Call] upload 오류: {e}")
         return _response(500, {"error": "내부 오류"})
 
 
