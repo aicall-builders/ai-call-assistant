@@ -486,15 +486,22 @@ def _handle_calls_list(event: dict) -> dict:
         limit    = int(params.get("limit", 20))
         offset   = int(params.get("offset", 0))
 
-        sql = "SELECT * FROM calls WHERE user_id = %s"
+        sql = """
+            SELECT c.*,
+                   s.summary, s.category, s.sentiment,
+                   s.action_required, s.keywords, s.extracted_info
+            FROM calls c
+            LEFT JOIN summaries s ON s.call_id = c.id
+            WHERE c.user_id = %s
+        """
         values = [uid]
         if store_id:
-            sql += " AND store_id = %s"
+            sql += " AND c.store_id = %s"
             values.append(store_id)
         if status:
-            sql += " AND status = %s"
+            sql += " AND c.status = %s"
             values.append(status)
-        sql += " ORDER BY created_at DESC LIMIT %s OFFSET %s"
+        sql += " ORDER BY c.created_at DESC LIMIT %s OFFSET %s"
         values += [limit, offset]
 
         with get_db() as conn:
