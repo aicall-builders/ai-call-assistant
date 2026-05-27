@@ -14,6 +14,7 @@ import requests
 from botocore.exceptions import ClientError
 
 from redis_client import set_nx_with_ttl, cache_get, cache_set, TTL_UPLOAD_LOCK
+from calendar_handler import handle_calendar_request
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -330,6 +331,8 @@ def lambda_handler(event: dict, context) -> dict:
         return _handle_stores_list(event)
     if path == "/stores" and method == "POST":
         return _handle_stores_create(event)
+    if path.startswith("/calendar") or (path.startswith("/calls/") and path.endswith("/calendar-events")):
+        return handle_calendar_request(event, context)
     if path == "/calls" and method == "GET":
         return _handle_calls_list(event)
     if path and path.startswith("/calls/") and path.endswith("/audio") and method == "GET":

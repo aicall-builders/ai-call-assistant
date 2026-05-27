@@ -3,3 +3,4 @@ pymysql
 requests
 firebase-admin
 openai
+redis>=5.0.0
