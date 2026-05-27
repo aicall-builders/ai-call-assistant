@@ -122,18 +122,39 @@ def invalidate_user_cache(uid: str):
     cache_delete(f"auth:user:{uid}")
 
 
+ALLOWED_ORIGINS = [
+    "https://dk1k75g0ji3vw.cloudfront.net",
+    "http://localhost:3000",
+]
+
+def _response(status: int, body: dict, event: dict = {}) -> dict:
+    request_origin = (event.get("headers") or {}).get("origin", "")
+    cors_origin = request_origin if request_origin in ALLOWED_ORIGINS else ALLOWED_ORIGINS[0]
+    return {
+        "statusCode": status,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": cors_origin,
+            "Access-Control-Allow-Headers": "Content-Type,Authorization",
+            "Access-Control-Allow-Methods": "POST,OPTIONS",
+        },
+        "body": json.dumps(body, ensure_ascii=False),
+    }
+
+
 def lambda_handler(event: dict, context) -> dict:
     path = event.get("path", "")
     method = event.get("httpMethod", "POST")
     if method == "OPTIONS":
-        return _response(200, {})
+        return _response(200, {}, event)
     if path == "/auth/kakao" and method == "POST":
         return _handle_kakao(event)
     if path == "/auth/logout" and method == "POST":
         return _handle_logout(event)
     if path == "/auth/verify" and method == "POST":
         return _handle_verify(event)
-    return _response(404, {"error": "Not found"})
+    return _response(404, {"error": "Not found"}, event)
+
 
 def _handle_kakao(event: dict) -> dict:
     try:
@@ -143,7 +164,7 @@ def _handle_kakao(event: dict) -> dict:
         nickname = body.get("nickname", "")
 
         if not kakao_id:
-            return _response(400, {"error": "kakao_id 필수"})
+            return _response(400, {"error": "kakao_id 필수"}, event)
 
         firebase_uid = f"kakao:{kakao_id}"
         custom_token = firebase_auth.create_custom_token(firebase_uid)
@@ -154,7 +175,6 @@ def _handle_kakao(event: dict) -> dict:
         if db:
             try:
                 with db.cursor() as cursor:
-                    # 기존 유저 조회
                     cursor.execute(
                         "SELECT id FROM users WHERE kakao_id = %s LIMIT 1",
                         (kakao_id,)
@@ -162,13 +182,11 @@ def _handle_kakao(event: dict) -> dict:
                     user = cursor.fetchone()
                     if user:
                         user_uuid = user["id"]
-                        # firebase_uid 업데이트
                         cursor.execute(
                             "UPDATE users SET firebase_uid = %s WHERE id = %s",
                             (firebase_uid, user_uuid)
                         )
                     else:
-                        # 신규 유저 생성
                         user_uuid = str(__import__("uuid").uuid4())
                         cursor.execute("""
                             INSERT INTO users (id, firebase_uid, kakao_id, name, role)
@@ -185,25 +203,25 @@ def _handle_kakao(event: dict) -> dict:
             "user_uuid": user_uuid,
             "email": email,
             "name": nickname,
-        })
+        }, event)
     except Exception as e:
         logger.exception(f"[Auth] kakao 처리 오류: {e}")
-        return _response(500, {"error": "내부 오류"})
+        return _response(500, {"error": "내부 오류"}, event)
 
 
 def _handle_verify(event: dict) -> dict:
     headers = event.get("headers", {}) or {}
     auth_header = headers.get("Authorization", headers.get("authorization", ""))
     if not auth_header.startswith("Bearer "):
-        return _response(401, {"error": "No Authorization header"})
+        return _response(401, {"error": "No Authorization header"}, event)
     id_token = auth_header[7:]
     token_payload = verify_firebase_token(id_token)
     if not token_payload:
-        return _response(401, {"error": "Invalid token"})
+        return _response(401, {"error": "Invalid token"}, event)
     user = get_user_info(token_payload["uid"])
     if not user:
-        return _response(404, {"error": "User not found"})
-    return _response(200, {"user": user})
+        return _response(404, {"error": "User not found"}, event)
+    return _response(200, {"user": user}, event)
 
 
 def _handle_logout(event: dict) -> dict:
@@ -215,17 +233,4 @@ def _handle_logout(event: dict) -> dict:
     uid = body.get("uid", "")
     if uid:
         invalidate_user_cache(uid)
-    return _response(200, {"message": "logged out"})
-
-
-def _response(status: int, body: dict) -> dict:
-    return {
-        "statusCode": status,
-        "headers": {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "https://dk1k75g0ji3vw.cloudfront.net",
-            "Access-Control-Allow-Headers": "Content-Type,Authorization",
-            "Access-Control-Allow-Methods": "POST,OPTIONS",
-        },
-        "body": json.dumps(body, ensure_ascii=False),
-    }
+    return _response(200, {"message": "logged out"}, event)
