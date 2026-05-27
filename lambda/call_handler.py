@@ -25,9 +25,27 @@ BUCKET_NAME    = os.environ.get("S3_BUCKET", "call-recoder-audio-1017")
 CLOVA_API_URL  = os.environ.get("CLOVA_API_URL", "")
 CLOVA_SECRET   = os.environ.get("CLOVA_SECRET_KEY", "")
 
-
 MAX_RETRY      = int(os.environ.get("STT_MAX_RETRY", 3))
 STALE_MINUTES  = int(os.environ.get("STT_STALE_MINUTES", 5))
+
+ALLOWED_ORIGINS = [
+    "https://dk1k75g0ji3vw.cloudfront.net",
+    "http://localhost:3000",
+]
+
+def _response(status: int, body: dict, event: dict = {}) -> dict:
+    request_origin = (event.get("headers") or {}).get("origin", "")
+    cors_origin = request_origin if request_origin in ALLOWED_ORIGINS else ALLOWED_ORIGINS[0]
+    return {
+        "statusCode": status,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": cors_origin,
+            "Access-Control-Allow-Headers": "Content-Type,Authorization",
+            "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
+        },
+        "body": json.dumps(body, ensure_ascii=False),
+    }
 
 def _get_db_password() -> str:
     secret_name = os.environ.get("DB_SECRET_NAME", "")
@@ -53,8 +71,6 @@ def get_db():
     }
     return pymysql.connect(**config)
 
-# ── 중복 업로드 체크 ──────────────────────────────────────────────────────────
-
 def _file_hash(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes).hexdigest()
 
@@ -69,9 +85,6 @@ def check_and_lock_upload(user_id: str, file_bytes: bytes) -> tuple[bool, str]:
         logger.warning(f"[Call] 중복 업로드 감지 user={user_id} hash={fhash[:16]}")
         return True, fhash
     return False, fhash
-
-
-# ── S3 업로드 ─────────────────────────────────────────────────────────────────
 
 def upload_to_s3(user_id: str, file_bytes: bytes, filename: str, file_hash: str) -> str:
     ext    = os.path.splitext(filename)[-1].lower() or ".wav"
@@ -92,9 +105,6 @@ def _content_type(ext: str) -> str:
         ".flac": "audio/flac", ".webm": "audio/webm",
     }.get(ext, "application/octet-stream")
 
-
-# ── calls 테이블 INSERT ───────────────────────────────────────────────────────
-
 def insert_call(user_id: str, store_id: str, s3_key: str,
                 caller_number: str = "", duration: int = 0) -> str:
     call_id = str(uuid.uuid4())
@@ -111,21 +121,12 @@ def insert_call(user_id: str, store_id: str, s3_key: str,
     logger.info(f"[Call] calls INSERT call_id={call_id}")
     return call_id
 
-
-# ── CLOVA STT 비동기 요청 ─────────────────────────────────────────────────────
-
 def request_clova_stt(call_id: str, s3_key: str) -> str | None:
-    """
-    CLOVA Async STT 요청 → clova_job_id 반환.
-    성공 시 calls.status = 'processing', clova_job_id 저장.
-    """
-    # S3 presigned URL 생성 (CLOVA가 직접 다운로드)
     presigned_url = s3.generate_presigned_url(
         "get_object",
         Params={"Bucket": BUCKET_NAME, "Key": s3_key},
         ExpiresIn=3600,
     )
-
     headers = {
         "Accept":               "application/json",
         "X-CLOVASPEECH-API-KEY": CLOVA_SECRET,
@@ -136,7 +137,6 @@ def request_clova_stt(call_id: str, s3_key: str) -> str | None:
         "language": "ko-KR",
         "completion": "async",
     }
-
     try:
         resp = requests.post(
             f"{CLOVA_API_URL}/recognizer/url",
@@ -146,39 +146,23 @@ def request_clova_stt(call_id: str, s3_key: str) -> str | None:
         job_id = resp.json().get("token")
         if not job_id:
             raise ValueError(f"CLOVA 응답에 token 없음: {resp.text}")
-
-        # DB 업데이트
         _update_call_status(call_id, status="processing", clova_job_id=job_id)
         logger.info(f"[CLOVA] STT 요청 완료 call_id={call_id} job_id={job_id}")
         return job_id
-
     except Exception as e:
         logger.error(f"[CLOVA] STT 요청 실패 call_id={call_id}: {e}")
         _update_call_status(call_id, status="error", error_message=str(e))
         return None
 
-
-# ════════════════════════════════════════════════════════════
-# 폴링 메커니즘 — EventBridge 5분 주기로 호출
-# ════════════════════════════════════════════════════════════
-
 def check_pending_stt(event=None, context=None):
-    """
-    status='processing' 이고 updated_at이 STALE_MINUTES분 이상 지난 통화 조회.
-    retry_count < MAX_RETRY → CLOVA 재조회
-    retry_count >= MAX_RETRY → Whisper fallback
-    """
     logger.info("[Polling] check_pending_stt 시작")
     pending = _query_pending_calls()
     logger.info(f"[Polling] 대상 {len(pending)}건")
-
     result = {"total": len(pending), "clova_ok": 0, "failed": 0}
-
     for call in pending:
         call_id     = call["id"]
         retry_count = call["retry_count"] or 0
         clova_job   = call.get("clova_job_id")
-
         try:
             if retry_count < MAX_RETRY and clova_job:
                 ok = _poll_clova(call_id, clova_job, retry_count)
@@ -190,16 +174,13 @@ def check_pending_stt(event=None, context=None):
                 _update_call_status(call_id, status="error",
                                     error_message="CLOVA STT 최대 재시도 초과")
                 result["failed"] += 1
-                
         except Exception as e:
             logger.error(f"[Polling] call_id={call_id} 오류: {e}", exc_info=True)
             _update_call_status(call_id, status="error", error_message=str(e))
             result["failed"] += 1
-
     logger.info(f"[Polling] 완료: {result}")
     _put_metrics(result)
     return {"statusCode": 200, "body": json.dumps(result, ensure_ascii=False)}
-
 
 def _put_metrics(result: dict) -> None:
     try:
@@ -207,21 +188,9 @@ def _put_metrics(result: dict) -> None:
         cloudwatch.put_metric_data(
             Namespace="CallRecorder/Polling",
             MetricData=[
-                {
-                    "MetricName": "PollingTotal",
-                    "Value": result["total"],
-                    "Unit": "Count",
-                },
-                {
-                    "MetricName": "PollingClovaOk",
-                    "Value": result["clova_ok"],
-                    "Unit": "Count",
-                },
-                {
-                    "MetricName": "PollingFailed",
-                    "Value": result["failed"],
-                    "Unit": "Count",
-                },
+                {"MetricName": "PollingTotal", "Value": result["total"], "Unit": "Count"},
+                {"MetricName": "PollingClovaOk", "Value": result["clova_ok"], "Unit": "Count"},
+                {"MetricName": "PollingFailed", "Value": result["failed"], "Unit": "Count"},
             ],
         )
         logger.info("[Metrics] CloudWatch 메트릭 전송 완료")
@@ -232,9 +201,8 @@ def _query_pending_calls() -> list[dict]:
     sql = """
         SELECT id, clova_job_id, s3_key, retry_count, updated_at
         FROM calls
-        WHERE
-            status = 'processing'
-            AND updated_at < NOW() - INTERVAL %s MINUTE
+        WHERE status = 'processing'
+        AND updated_at < NOW() - INTERVAL %s MINUTE
         ORDER BY updated_at ASC
         LIMIT 50
     """
@@ -242,9 +210,6 @@ def _query_pending_calls() -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(sql, (STALE_MINUTES,))
             return cur.fetchall()
-
-
-# ── CLOVA 재조회 ──────────────────────────────────────────────────────────────
 
 def _poll_clova(call_id: str, job_id: str, retry_count: int) -> bool:
     logger.info(f"[CLOVA] 재조회 call_id={call_id} job_id={job_id} retry={retry_count}")
@@ -260,30 +225,24 @@ def _poll_clova(call_id: str, job_id: str, retry_count: int) -> bool:
         resp.raise_for_status()
         data   = resp.json()
         status = data.get("status", "").lower()
-
         if status == "completed":
             transcript = _extract_transcript(data)
             _update_call_status(call_id, status="transcribed", stt_result=transcript)
             logger.info(f"[CLOVA] 완료 call_id={call_id}")
             _invoke_nlp(call_id, transcript)
             return True
-
         elif status in ("failed", "error"):
             logger.warning(f"[CLOVA] 실패 → 최대 재시도로 전환 call_id={call_id}")
             _increment_retry(call_id, force_max=True)
             return False
-
         else:
-            # 아직 진행 중
             _increment_retry(call_id, retry_count=retry_count)
             logger.info(f"[CLOVA] 진행중 call_id={call_id} status={status}")
             return False
-
     except Exception as e:
         logger.error(f"[CLOVA] 재조회 오류 call_id={call_id}: {e}")
         _increment_retry(call_id, retry_count=retry_count)
         return False
-
 
 def _extract_transcript(data: dict) -> str:
     segments = data.get("segments", [])
@@ -296,10 +255,7 @@ def _invoke_nlp(call_id: str, transcript: str) -> None:
         response = lambda_client.invoke(
             FunctionName="call-recorder-api-nlp",
             InvocationType="RequestResponse",
-            Payload=json.dumps({
-                "call_id": call_id,
-                "transcript": transcript,
-            }).encode(),
+            Payload=json.dumps({"call_id": call_id, "transcript": transcript}).encode(),
         )
         payload = json.loads(response["Payload"].read())
         body = json.loads(payload.get("body", "{}"))
@@ -309,20 +265,17 @@ def _invoke_nlp(call_id: str, transcript: str) -> None:
     except Exception as e:
         logger.error(f"[NLP] invoke 실패 call_id={call_id}: {e}")
 
-
 def _insert_summary(call_id: str, result: dict) -> None:
     sql = """
         INSERT INTO summaries
             (id, call_id, summary, category, sentiment,
              action_required, keywords, extracted_info)
-        VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
     """
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, (
-                str(uuid.uuid4()),
-                call_id,
+                str(uuid.uuid4()), call_id,
                 result.get("summary", ""),
                 result.get("category", "기타"),
                 result.get("sentiment", "neutral"),
@@ -333,16 +286,12 @@ def _insert_summary(call_id: str, result: dict) -> None:
         conn.commit()
     logger.info(f"[Call] summaries INSERT 완료 call_id={call_id}")
 
-
-# ── DB 업데이트 헬퍼 ──────────────────────────────────────────────────────────
-
 def _update_call_status(call_id: str, *, status: str,
                          clova_job_id: str = None,
                          stt_result: str = None,
                          error_message: str = None) -> None:
     fields = ["status = %s", "updated_at = NOW()"]
     values = [status]
-
     if clova_job_id is not None:
         fields.append("clova_job_id = %s")
         values.append(clova_job_id)
@@ -352,15 +301,12 @@ def _update_call_status(call_id: str, *, status: str,
     if error_message is not None:
         fields.append("error_message = %s")
         values.append(error_message)
-
     values.append(call_id)
     sql = f"UPDATE calls SET {', '.join(fields)} WHERE id = %s"
-
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, values)
         conn.commit()
-
 
 def _increment_retry(call_id: str, retry_count: int = 0, force_max: bool = False) -> None:
     new_count = MAX_RETRY if force_max else retry_count + 1
@@ -370,9 +316,6 @@ def _increment_retry(call_id: str, retry_count: int = 0, force_max: bool = False
             cur.execute(sql, (new_count, call_id))
         conn.commit()
 
-
-# ── Lambda 핸들러 ─────────────────────────────────────────────────────────────
-
 def lambda_handler(event: dict, context) -> dict:
     path   = event.get("path", "")
     method = event.get("httpMethod", "GET")
@@ -381,15 +324,12 @@ def lambda_handler(event: dict, context) -> dict:
         return check_pending_stt(event, context)
 
     if method == "OPTIONS":
-        return _response(200, {})
+        return _response(200, {}, event)
 
-    # stores
     if path == "/stores" and method == "GET":
         return _handle_stores_list(event)
     if path == "/stores" and method == "POST":
         return _handle_stores_create(event)
-
-    # calls
     if path == "/calls" and method == "GET":
         return _handle_calls_list(event)
     if path and path.startswith("/calls/") and path.endswith("/audio") and method == "GET":
@@ -410,7 +350,7 @@ def lambda_handler(event: dict, context) -> dict:
     if path == "/calls/upload" and method == "POST":
         return _handle_upload(event)
 
-    return _response(404, {"error": "Not found"})
+    return _response(404, {"error": "Not found"}, event)
 
 def _get_uid(event: dict) -> str | None:
     headers = event.get("headers", {}) or {}
@@ -426,7 +366,6 @@ def _get_uid(event: dict) -> str | None:
         firebase_uid = payload.get("user_id") or payload.get("sub")
         if not firebase_uid:
             return None
-        # firebase_uid로 users.id(UUID) 조회
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -439,11 +378,10 @@ def _get_uid(event: dict) -> str | None:
         logger.error(f"[Call] _get_uid 오류: {e}")
         return None
 
-
 def _handle_stores_list(event: dict) -> dict:
     uid = _get_uid(event)
     if not uid:
-        return _response(401, {"error": "인증 필요"})
+        return _response(401, {"error": "인증 필요"}, event)
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -453,21 +391,20 @@ def _handle_stores_list(event: dict) -> dict:
                 )
                 stores = cur.fetchall()
         result = [{k: str(v) if hasattr(v, "isoformat") else v for k, v in s.items()} for s in stores]
-        return _response(200, {"stores": result})
+        return _response(200, {"stores": result}, event)
     except Exception as e:
         logger.exception(f"[Store] list 오류: {e}")
-        return _response(500, {"error": "내부 오류"})
-
+        return _response(500, {"error": "내부 오류"}, event)
 
 def _handle_stores_create(event: dict) -> dict:
     uid = _get_uid(event)
     if not uid:
-        return _response(401, {"error": "인증 필요"})
+        return _response(401, {"error": "인증 필요"}, event)
     try:
         body = json.loads(event.get("body") or "{}")
         name = body.get("name", "").strip()
         if not name:
-            return _response(400, {"error": "name 필수"})
+            return _response(400, {"error": "name 필수"}, event)
         store_id = str(uuid.uuid4())
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -476,23 +413,21 @@ def _handle_stores_create(event: dict) -> dict:
                     (store_id, name, uid)
                 )
             conn.commit()
-        return _response(201, {"id": store_id, "name": name, "owner_id": uid})
+        return _response(201, {"id": store_id, "name": name, "owner_id": uid}, event)
     except Exception as e:
         logger.exception(f"[Store] create 오류: {e}")
-        return _response(500, {"error": "내부 오류"})
-
+        return _response(500, {"error": "내부 오류"}, event)
 
 def _handle_calls_list(event: dict) -> dict:
     uid = _get_uid(event)
     if not uid:
-        return _response(401, {"error": "인증 필요"})
+        return _response(401, {"error": "인증 필요"}, event)
     try:
         params = event.get("queryStringParameters") or {}
         store_id = params.get("store_id")
         status   = params.get("status")
         limit    = int(params.get("limit", 20))
         offset   = int(params.get("offset", 0))
-
         sql = """
             SELECT c.*,
                    s.summary, s.category, s.sentiment,
@@ -510,45 +445,42 @@ def _handle_calls_list(event: dict) -> dict:
             values.append(status)
         sql += " ORDER BY c.created_at DESC LIMIT %s OFFSET %s"
         values += [limit, offset]
-
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, values)
                 calls = cur.fetchall()
         result = [{k: str(v) if hasattr(v, "isoformat") else v for k, v in c.items()} for c in calls]
-        return _response(200, {"calls": result})
+        return _response(200, {"calls": result}, event)
     except Exception as e:
         logger.exception(f"[Call] list 오류: {e}")
-        return _response(500, {"error": "내부 오류"})
-
+        return _response(500, {"error": "내부 오류"}, event)
 
 def _handle_call_get(event: dict, call_id: str) -> dict:
     uid = _get_uid(event)
     if not uid:
-        return _response(401, {"error": "인증 필요"})
+        return _response(401, {"error": "인증 필요"}, event)
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT * FROM calls WHERE id = %s AND user_id = %s", (call_id, uid))
                 call = cur.fetchone()
         if not call:
-            return _response(404, {"error": "통화를 찾을 수 없습니다"})
+            return _response(404, {"error": "통화를 찾을 수 없습니다"}, event)
         result = {k: str(v) if hasattr(v, "isoformat") else v for k, v in call.items()}
-        return _response(200, {"call": result})
+        return _response(200, {"call": result}, event)
     except Exception as e:
         logger.exception(f"[Call] get 오류: {e}")
-        return _response(500, {"error": "내부 오류"})
-
+        return _response(500, {"error": "내부 오류"}, event)
 
 def _handle_call_patch(event: dict, call_id: str) -> dict:
     uid = _get_uid(event)
     if not uid:
-        return _response(401, {"error": "인증 필요"})
+        return _response(401, {"error": "인증 필요"}, event)
     try:
         body = json.loads(event.get("body") or "{}")
         caller_category = body.get("caller_category", "").strip()
         if caller_category not in ("BUSINESS", "PERSONAL", "UNCLASSIFIED"):
-            return _response(400, {"error": "유효하지 않은 category"})
+            return _response(400, {"error": "유효하지 않은 category"}, event)
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -556,82 +488,76 @@ def _handle_call_patch(event: dict, call_id: str) -> dict:
                     (caller_category, call_id, uid)
                 )
             conn.commit()
-        return _response(200, {"message": "업데이트 완료"})
+        return _response(200, {"message": "업데이트 완료"}, event)
     except Exception as e:
         logger.exception(f"[Call] patch 오류: {e}")
-        return _response(500, {"error": "내부 오류"})
-
+        return _response(500, {"error": "내부 오류"}, event)
 
 def _handle_call_delete(event: dict, call_id: str) -> dict:
     uid = _get_uid(event)
     if not uid:
-        return _response(401, {"error": "인증 필요"})
+        return _response(401, {"error": "인증 필요"}, event)
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM calls WHERE id = %s AND user_id = %s", (call_id, uid))
             conn.commit()
-        return _response(200, {"message": "삭제 완료"})
+        return _response(200, {"message": "삭제 완료"}, event)
     except Exception as e:
         logger.exception(f"[Call] delete 오류: {e}")
-        return _response(500, {"error": "내부 오류"})
-
+        return _response(500, {"error": "내부 오류"}, event)
 
 def _handle_call_audio(event: dict, call_id: str) -> dict:
     uid = _get_uid(event)
     if not uid:
-        return _response(401, {"error": "인증 필요"})
+        return _response(401, {"error": "인증 필요"}, event)
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT s3_key FROM calls WHERE id = %s AND user_id = %s", (call_id, uid))
                 call = cur.fetchone()
         if not call:
-            return _response(404, {"error": "통화를 찾을 수 없습니다"})
+            return _response(404, {"error": "통화를 찾을 수 없습니다"}, event)
         url = s3.generate_presigned_url(
             "get_object",
             Params={"Bucket": BUCKET_NAME, "Key": call["s3_key"]},
             ExpiresIn=600,
         )
-        return _response(200, {"url": url})
+        return _response(200, {"url": url}, event)
     except Exception as e:
         logger.exception(f"[Call] audio 오류: {e}")
-        return _response(500, {"error": "내부 오류"})
-
+        return _response(500, {"error": "내부 오류"}, event)
 
 def _handle_call_process(event: dict, call_id: str) -> dict:
     uid = _get_uid(event)
     if not uid:
-        return _response(401, {"error": "인증 필요"})
+        return _response(401, {"error": "인증 필요"}, event)
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT s3_key FROM calls WHERE id = %s AND user_id = %s", (call_id, uid))
                 call = cur.fetchone()
         if not call:
-            return _response(404, {"error": "통화를 찾을 수 없습니다"})
+            return _response(404, {"error": "통화를 찾을 수 없습니다"}, event)
         job_id = request_clova_stt(call_id, call["s3_key"])
-        return _response(200, {"message": "STT 처리 시작", "clova_job_id": job_id})
+        return _response(200, {"message": "STT 처리 시작", "clova_job_id": job_id}, event)
     except Exception as e:
         logger.exception(f"[Call] process 오류: {e}")
-        return _response(500, {"error": "내부 오류"})
+        return _response(500, {"error": "내부 오류"}, event)
 
 def _handle_upload(event: dict) -> dict:
     uid = _get_uid(event)
     if not uid:
-        return _response(401, {"error": "인증 필요"})
+        return _response(401, {"error": "인증 필요"}, event)
     try:
         body        = json.loads(event.get("body") or "{}")
         store_id    = body.get("store_id", "").strip()
         file_name   = body.get("file_name", "recording.m4a").strip()
         mime_type   = body.get("mime_type", "audio/mp4").strip()
-
         if not store_id:
-            return _response(400, {"error": "store_id 필수"})
-
+            return _response(400, {"error": "store_id 필수"}, event)
         call_id = str(uuid.uuid4())
         s3_key  = f"recordings/{store_id}/{call_id}/{file_name}"
-
         upload_url = s3.generate_presigned_url(
             "put_object",
             Params={
@@ -641,7 +567,6 @@ def _handle_upload(event: dict) -> dict:
             },
             ExpiresIn=600,
         )
-
         sql = """
             INSERT INTO calls (id, store_id, user_id, s3_key, status)
             VALUES (%s, %s, %s, %s, 'uploaded')
@@ -650,26 +575,11 @@ def _handle_upload(event: dict) -> dict:
             with conn.cursor() as cur:
                 cur.execute(sql, (call_id, store_id, uid, s3_key))
             conn.commit()
-
         return _response(200, {
             "call_id": call_id,
             "upload_url": upload_url,
             "s3_key": s3_key,
-        })
-
+        }, event)
     except Exception as e:
         logger.exception(f"[Call] upload 오류: {e}")
-        return _response(500, {"error": "내부 오류"})
-
-
-def _response(status: int, body: dict) -> dict:
-    return {
-        "statusCode": status,
-        "headers": {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "https://dk1k75g0ji3vw.cloudfront.net",
-            "Access-Control-Allow-Headers": "Content-Type,Authorization",
-            "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
-        },
-        "body": json.dumps(body, ensure_ascii=False),
-    }
+        return _response(500, {"error": "내부 오류"}, event)
