@@ -109,3 +109,50 @@ def set_nx_with_ttl(key: str, value: str, ttl: int) -> bool:
     except RedisError as e:
         logger.warning(f"[Redis] SET NX 실패 key={key}: {e}")
         return True  # 실패 시 통과 (안전 방향)
+
+
+# ── Rate Limiting ──────────────────────────────────────────────────────────────
+
+# 제한 설정
+RATE_LIMIT_REQUESTS = int(os.environ.get("RATE_LIMIT_REQUESTS", 60))  # 최대 요청 수
+RATE_LIMIT_WINDOW   = int(os.environ.get("RATE_LIMIT_WINDOW", 60))    # 시간 윈도우 (초)
+
+
+def check_rate_limit(user_id: str, action: str = "api") -> tuple[bool, int]:
+    """
+    유저별 Rate Limiting 체크 (Redis INCR + EXPIRE)
+
+    Returns:
+        (allowed, remaining)
+        allowed   — True: 요청 허용 / False: 429 차단
+        remaining — 남은 요청 횟수
+
+    사용 예:
+        allowed, remaining = check_rate_limit(uid, "upload")
+        if not allowed:
+            return _response(429, {"error": "요청 한도 초과. 잠시 후 다시 시도해주세요."}, event)
+    """
+    r = get_redis()
+    if r is None:
+        # Redis 연결 없으면 통과 (서비스 우선)
+        logger.warning("[RateLimit] Redis 없음 → 통과 처리")
+        return True, RATE_LIMIT_REQUESTS
+
+    key = f"ratelimit:{action}:{user_id}"
+    try:
+        current = r.incr(key)
+        if current == 1:
+            # 첫 요청 → TTL 설정
+            r.expire(key, RATE_LIMIT_WINDOW)
+
+        remaining = max(0, RATE_LIMIT_REQUESTS - current)
+
+        if current > RATE_LIMIT_REQUESTS:
+            logger.warning(f"[RateLimit] 한도 초과 user={user_id} action={action} count={current}")
+            return False, 0
+
+        return True, remaining
+
+    except RedisError as e:
+        logger.warning(f"[RateLimit] 체크 실패 key={key}: {e}")
+        return True, RATE_LIMIT_REQUESTS  # 실패 시 통과 (서비스 우선)

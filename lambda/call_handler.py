@@ -13,7 +13,7 @@ import pymysql.cursors
 import requests
 from botocore.exceptions import ClientError
 
-from redis_client import set_nx_with_ttl, cache_get, cache_set, TTL_UPLOAD_LOCK
+from redis_client import set_nx_with_ttl, cache_get, cache_set, TTL_UPLOAD_LOCK, check_rate_limit
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -422,6 +422,12 @@ def _handle_calls_list(event: dict) -> dict:
     uid = _get_uid(event)
     if not uid:
         return _response(401, {"error": "인증 필요"}, event)
+
+    # Rate Limiting — 조회는 1분에 60회 제한
+    allowed, _ = check_rate_limit(uid, "api")
+    if not allowed:
+        return _response(429, {"error": "요청 한도 초과. 잠시 후 다시 시도해주세요."}, event)
+
     try:
         params = event.get("queryStringParameters") or {}
         store_id = params.get("store_id")
@@ -549,6 +555,12 @@ def _handle_upload(event: dict) -> dict:
     uid = _get_uid(event)
     if not uid:
         return _response(401, {"error": "인증 필요"}, event)
+
+    # Rate Limiting — 업로드는 1분에 10회 제한
+    allowed, remaining = check_rate_limit(uid, "upload")
+    if not allowed:
+        return _response(429, {"error": "요청 한도 초과. 잠시 후 다시 시도해주세요."}, event)
+
     try:
         body        = json.loads(event.get("body") or "{}")
         store_id    = body.get("store_id", "").strip()
