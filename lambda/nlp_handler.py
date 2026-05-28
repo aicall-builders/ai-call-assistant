@@ -80,6 +80,42 @@ def analyze_keywords(text: str, keywords: dict) -> dict:
             results[category] = found
     return results
 
+# ── 가드레일 상수 ──────────────────────────────────────────────────────────────
+VALID_CATEGORIES = {"문의", "불만", "예약", "취소", "기타"}
+VALID_SENTIMENTS = {"positive", "neutral", "negative"}
+
+
+def _validate_gpt_result(result: dict) -> dict:
+    """
+    GPT 응답 유효성 검증 + 보정 (가드레일)
+    - category / sentiment 허용값 범위 체크
+    - action_required bool 타입 보정
+    - keywords list 타입 보정
+    - summary 빈값 보정
+    """
+    if result.get("category") not in VALID_CATEGORIES:
+        logger.warning(f"[NLP] 비정상 category={result.get('category')} → '기타'로 보정")
+        result["category"] = "기타"
+
+    if result.get("sentiment") not in VALID_SENTIMENTS:
+        logger.warning(f"[NLP] 비정상 sentiment={result.get('sentiment')} → 'neutral'로 보정")
+        result["sentiment"] = "neutral"
+
+    if not isinstance(result.get("action_required"), bool):
+        result["action_required"] = False
+
+    if not isinstance(result.get("keywords"), list):
+        result["keywords"] = []
+
+    if not result.get("summary", "").strip():
+        result["summary"] = "요약 없음"
+
+    if not isinstance(result.get("extracted_info"), dict):
+        result["extracted_info"] = {}
+
+    return result
+
+
 def analyze_with_gpt(call_id: str, transcript: str) -> dict | None:
     prompt = f"""다음 통화 내용을 분석해주세요.
 
@@ -107,11 +143,23 @@ def analyze_with_gpt(call_id: str, transcript: str) -> dict | None:
             max_tokens=500,
         )
         raw = response.choices[0].message.content.strip()
+
+        # JSON 마크다운 펜스 제거 (GPT가 ```json ... ``` 형태로 줄 때 대비)
+        if raw.startswith("```"):
+            raw = raw.strip("`").strip()
+            if raw.startswith("json"):
+                raw = raw[4:].strip()
+
         result = json.loads(raw)
-        logger.info(f"[NLP] GPT 분석 완료 call_id={call_id}")
+
+        # 가드레일 적용
+        result = _validate_gpt_result(result)
+
+        logger.info(f"[NLP] GPT 분석 완료 call_id={call_id} category={result['category']}")
         return result
+
     except json.JSONDecodeError as e:
-        logger.error(f"[NLP] GPT 응답 파싱 실패 call_id={call_id}: {e}")
+        logger.error(f"[NLP] GPT 응답 파싱 실패 call_id={call_id}: {e} raw={raw[:100]}")
         return None
     except Exception as e:
         logger.error(f"[NLP] GPT 분석 오류 call_id={call_id}: {e}")
