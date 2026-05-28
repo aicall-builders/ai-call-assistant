@@ -738,14 +738,49 @@ def _create_naver_event(access_token: str, event_data: dict[str, Any], calendar_
         "END:VEVENT",
         "END:VCALENDAR",
     ])
-    payload = {"calendarId": calendar_id or "defaultCalendarId", "scheduleIcalString": ical}
-    headers = {"Authorization": f"Bearer {access_token}"}
-    cfg = _provider_config("naver")
-    if cfg.get("client_id"):
-        headers["X-Naver-Client-Id"] = cfg["client_id"]
-    if cfg.get("client_secret"):
-        headers["X-Naver-Client-Secret"] = cfg["client_secret"]
-    res = requests.post("https://openapi.naver.com/calendar/createSchedule.json", headers=headers, data=payload, timeout=10)
+    payload = {
+    "calendarId": calendar_id or "defaultCalendarId",
+    "scheduleIcalString": ical,
+    }
+
+    naver_client_id = os.getenv("NAVER_CLIENT_ID", "").strip()
+    naver_client_secret = os.getenv("NAVER_CLIENT_SECRET", "").strip()
+
+    if not naver_client_id or not naver_client_secret:
+        raise RuntimeError("NAVER_CLIENT_ID or NAVER_CLIENT_SECRET is missing")
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Naver-Client-Id": naver_client_id,
+        "X-Naver-Client-Secret": naver_client_secret,
+    }
+
+    profile_check = requests.get(
+        "https://openapi.naver.com/v1/nid/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=10,
+    )
+
+    logger.info(
+        "[Calendar][Naver] token diagnostics profile_status=%s access_token_len=%s calendar_id=%s ical_len=%s",
+        profile_check.status_code,
+        len(access_token or ""),
+        calendar_id or "defaultCalendarId",
+        len(ical),
+    )
+
+    if profile_check.status_code >= 400:
+        logger.warning(
+            "[Calendar][Naver] profile token check failed body=%s",
+            profile_check.text[:300],
+        )
+    res = requests.post(
+        "https://openapi.naver.com/calendar/createSchedule.json",
+        headers=headers,
+        data=payload,
+        timeout=10,
+    )
     if res.status_code >= 400:
         raise RuntimeError(f"Naver Calendar 등록 실패: {res.status_code} {res.text[:500]}")
     try:
