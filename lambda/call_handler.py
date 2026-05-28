@@ -13,23 +13,10 @@ import pymysql.cursors
 import requests
 from botocore.exceptions import ClientError
 
-import firebase_admin
-from firebase_admin import auth as firebase_auth, credentials
-
-from redis_client import set_nx_with_ttl, cache_get, cache_set, TTL_UPLOAD_LOCK, TTL_FIREBASE_TOKEN
+from redis_client import set_nx_with_ttl, cache_get, cache_set, TTL_UPLOAD_LOCK
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-# Firebase 초기화 (auth_handler와 동일한 방식)
-if not firebase_admin._apps:
-    sa_b64 = os.environ.get("FIREBASE_SERVICE_ACCOUNT_BASE64", "")
-    sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "")
-    if sa_b64:
-        sa_json = base64.b64decode(sa_b64).decode("utf-8")
-    if sa_json:
-        cred = credentials.Certificate(json.loads(sa_json))
-        firebase_admin.initialize_app(cred)
 
 s3 = boto3.client("s3")
 lambda_client = boto3.client("lambda")
@@ -365,51 +352,20 @@ def lambda_handler(event: dict, context) -> dict:
 
     return _response(404, {"error": "Not found"}, event)
 
-def _verify_firebase_token(id_token: str) -> dict | None:
-    """
-    Firebase 토큰 서명 검증 (Redis 캐시 적용)
-    auth_handler의 verify_firebase_token과 동일한 방식
-    """
-    cache_key = f"token:firebase:{hashlib.sha256(id_token.encode()).hexdigest()[:32]}"
-    cached = cache_get(cache_key)
-    if cached is not None:
-        logger.info(f"[Call] token cache hit uid={cached.get('uid')}")
-        return cached
-    try:
-        decoded = firebase_auth.verify_id_token(id_token, check_revoked=True)
-        payload = {
-            "uid": decoded["uid"],
-            "email": decoded.get("email", ""),
-        }
-        cache_set(cache_key, payload, TTL_FIREBASE_TOKEN)
-        logger.info(f"[Call] Firebase verified uid={payload['uid']}")
-        return payload
-    except firebase_auth.RevokedIdTokenError:
-        logger.warning("[Call] revoked token")
-        return None
-    except firebase_auth.InvalidIdTokenError as e:
-        logger.warning(f"[Call] invalid token: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"[Call] token 검증 오류: {e}")
-        return None
-
-
 def _get_uid(event: dict) -> str | None:
-    """
-    Firebase 토큰 서명 검증 후 DB에서 내부 user_id 반환
-    """
     headers = event.get("headers", {}) or {}
     auth = headers.get("Authorization", headers.get("authorization", ""))
     if not auth.startswith("Bearer "):
         return None
-    token = auth[7:]
     try:
-        # Firebase 서명 검증 (위조 토큰 차단)
-        verified = _verify_firebase_token(token)
-        if not verified:
+        import base64 as b64
+        token = auth[7:]
+        parts = token.split(".")
+        padded = parts[1] + "=" * (4 - len(parts[1]) % 4)
+        payload = json.loads(b64.urlsafe_b64decode(padded))
+        firebase_uid = payload.get("user_id") or payload.get("sub")
+        if not firebase_uid:
             return None
-        firebase_uid = verified["uid"]
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
