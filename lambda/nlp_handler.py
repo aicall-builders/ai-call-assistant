@@ -1,19 +1,18 @@
 """
-nlp_handler.py — keywords.json 핫리로드 with Redis
+nlp_handler.py — 도메인 자동 파악 + 업종별 맞춤 키워드 + 문자 생성
 변경점:
-  - S3에서 keywords.json 읽을 때 Redis 캐시 우선 조회
-  - TTL 1시간, 만료 시 자동 S3 재조회
-  - POST /admin/reload-keywords 로 강제 무효화 가능
+  - 도메인 자동 파악 (미용실/음식점/부동산/병원/네일샵/자동차정비/기타)
+  - 업종별 맞춤 키워드 추출
+  - 소상공인용 내부 정보 + 고객용 SMS 분리
+  - 가드레일 강화
 """
 import os
 import json
-import hashlib
 import logging
 import boto3
 import openai
 
 from botocore.exceptions import ClientError
-
 from redis_client import cache_get, cache_set, cache_delete, TTL_KEYWORDS
 
 logger = logging.getLogger(__name__)
@@ -21,48 +20,93 @@ logger.setLevel(logging.INFO)
 
 s3 = boto3.client("s3")
 
-BUCKET_NAME   = os.environ.get("S3_BUCKET", "call-recoder-audio-1017")
-KEYWORDS_KEY  = os.environ.get("KEYWORDS_S3_KEY", "config/keywords.json")
-CACHE_KEY     = "nlp:keywords"          # Redis 키
-CACHE_KEY_HASH = "nlp:keywords:hash"    # S3 ETag 저장 (변경 감지용)
-
+BUCKET_NAME    = os.environ.get("S3_BUCKET", "call-recoder-audio-1017")
+KEYWORDS_KEY   = os.environ.get("KEYWORDS_S3_KEY", "config/keywords.json")
+CACHE_KEY      = "nlp:keywords"
+CACHE_KEY_HASH = "nlp:keywords:hash"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 openai.api_key = OPENAI_API_KEY
 
 
+# ── 도메인별 키워드 구조 정의 ──────────────────────────────────────────────────
+DOMAIN_SCHEMA = {
+    "미용실": {
+        "시술":     "어떤 시술을 원하는지 (예: 커트+염색, 펌, 매직)",
+        "일정":     "예약 날짜와 시간 (예: 6월 1일 오후 2시)",
+        "고객상태": "단골/첫방문/재방문 여부",
+        "두피상태": "두피/모발 상태 (예: 민감성 두피, 손상모)",
+        "액션":     "소상공인이 준비해야 할 것 (예: 저자극 약품 준비)",
+    },
+    "음식점": {
+        "예약인원": "몇 명인지 (예: 4인)",
+        "일정":     "예약 날짜와 시간 (예: 6월 1일 저녁 7시)",
+        "요청사항": "특별 요청 (예: 생일케이크, 룸 요청)",
+        "식이제한": "식이 제한 사항 (예: 채식, 견과류 알러지)",
+        "액션":     "준비해야 할 것 (예: 룸 세팅, 케이크 주문)",
+    },
+    "부동산": {
+        "매물종류":  "매물 유형 (예: 아파트 전세, 빌라 월세)",
+        "희망조건": "고객 조건 (예: 32평 3억 이하, 역세권)",
+        "방문일정": "방문 희망 날짜 (예: 토요일 오후)",
+        "고객성향": "고객 성향 (예: 급매 희망, 투자 목적)",
+        "액션":     "준비해야 할 것 (예: 유사 매물 리스트 준비)",
+    },
+    "병원": {
+        "진료과목": "진료 과목 (예: 정형외과, 내과)",
+        "증상":     "주요 증상 (예: 허리 디스크 의심, 감기)",
+        "일정":     "예약 날짜와 시간 (예: 6월 2일 오전 10시)",
+        "진료유형": "초진/재진 여부",
+        "액션":     "준비해야 할 것 (예: 차트 준비, MRI 예약)",
+    },
+    "네일샵": {
+        "시술":     "시술 종류 (예: 젤네일 프렌치, 아트)",
+        "일정":     "예약 날짜와 시간 (예: 6월 3일 오후 3시)",
+        "고객상태": "단골/첫방문/재방문 여부",
+        "네일상태": "현재 네일 상태 (예: 젤 제거 필요, 자연네일)",
+        "액션":     "준비해야 할 것 (예: 제거 시간 포함, 재료 준비)",
+    },
+    "자동차정비": {
+        "차량정보": "차종과 연식 (예: 소나타 2020 가솔린)",
+        "정비항목": "정비 내용 (예: 엔진오일+타이어 교체)",
+        "입고일정": "입고 날짜 (예: 내일 오전)",
+        "차량상태": "차량 상태 (예: 정기 점검, 이상 소음)",
+        "액션":     "준비해야 할 것 (예: 부품 재고 확인, 대차 준비)",
+    },
+    "기타": {
+        "주요내용": "통화의 핵심 내용",
+        "고객요청": "고객이 원하는 것",
+        "일정":     "관련 날짜/시간",
+        "고객상태": "고객 상황",
+        "액션":     "처리해야 할 것",
+    },
+}
+
+VALID_DOMAINS    = set(DOMAIN_SCHEMA.keys())
+VALID_CATEGORIES = {"문의", "불만", "예약", "취소", "기타"}
+VALID_SENTIMENTS = {"positive", "neutral", "negative"}
+
 
 # ── keywords 로딩 ──────────────────────────────────────────────────────────────
-
 def load_keywords(force_reload: bool = False) -> dict:
-    """
-    keywords.json 로드 순서:
-    1. force_reload=True  → 캐시 무효화 후 S3 강제 조회
-    2. Redis 캐시 hit     → 즉시 반환
-    3. Redis 캐시 miss    → S3 조회 후 캐싱
-    """
     if force_reload:
         cache_delete(CACHE_KEY)
         cache_delete(CACHE_KEY_HASH)
         logger.info("[NLP] 강제 리로드: Redis 캐시 삭제")
 
-    # 캐시 조회
     cached = cache_get(CACHE_KEY)
     if cached is not None:
         logger.info("[NLP] keywords 캐시 hit")
         return cached
 
-    # S3 조회
     logger.info("[NLP] keywords 캐시 miss → S3 조회")
     try:
         response = s3.get_object(Bucket=BUCKET_NAME, Key=KEYWORDS_KEY)
         keywords = json.loads(response["Body"].read().decode("utf-8"))
         etag = response.get("ETag", "")
-
         cache_set(CACHE_KEY, keywords, TTL_KEYWORDS)
         cache_set(CACHE_KEY_HASH, etag, TTL_KEYWORDS)
         logger.info(f"[NLP] S3 keywords 로드 완료, ETag={etag}")
         return keywords
-
     except ClientError as e:
         logger.error(f"[NLP] S3 keywords 로드 실패: {e}")
         return {}
@@ -72,7 +116,6 @@ def load_keywords(force_reload: bool = False) -> dict:
 
 
 def analyze_keywords(text: str, keywords: dict) -> dict:
-    """텍스트에서 키워드 탐지 (기존 로직 유지, 구조만 예시)"""
     results = {}
     for category, word_list in keywords.items():
         found = [w for w in word_list if w in text]
@@ -80,71 +123,119 @@ def analyze_keywords(text: str, keywords: dict) -> dict:
             results[category] = found
     return results
 
-# ── 가드레일 상수 ──────────────────────────────────────────────────────────────
-VALID_CATEGORIES = {"문의", "불만", "예약", "취소", "기타"}
-VALID_SENTIMENTS = {"positive", "neutral", "negative"}
 
-
+# ── 가드레일 ──────────────────────────────────────────────────────────────────
 def _validate_gpt_result(result: dict) -> dict:
-    """
-    GPT 응답 유효성 검증 + 보정 (가드레일)
-    - category / sentiment 허용값 범위 체크
-    - action_required bool 타입 보정
-    - keywords list 타입 보정
-    - summary 빈값 보정
-    """
+    """GPT 응답 유효성 검증 + 보정"""
+
+    # 도메인 검증
+    if result.get("domain") not in VALID_DOMAINS:
+        logger.warning(f"[NLP] 비정상 domain={result.get('domain')} → '기타'로 보정")
+        result["domain"] = "기타"
+
+    # category 검증
     if result.get("category") not in VALID_CATEGORIES:
         logger.warning(f"[NLP] 비정상 category={result.get('category')} → '기타'로 보정")
         result["category"] = "기타"
 
+    # sentiment 검증
     if result.get("sentiment") not in VALID_SENTIMENTS:
         logger.warning(f"[NLP] 비정상 sentiment={result.get('sentiment')} → 'neutral'로 보정")
         result["sentiment"] = "neutral"
 
+    # action_required 검증
     if not isinstance(result.get("action_required"), bool):
         result["action_required"] = False
 
-    if not isinstance(result.get("keywords"), list):
-        result["keywords"] = []
+    # internal 검증
+    if not isinstance(result.get("internal"), dict):
+        result["internal"] = {}
 
-    if not result.get("summary", "").strip():
-        result["summary"] = "요약 없음"
+    internal = result["internal"]
 
-    if not isinstance(result.get("extracted_info"), dict):
-        result["extracted_info"] = {}
+    if not internal.get("summary", "").strip():
+        internal["summary"] = "요약 없음"
+
+    if not isinstance(internal.get("keywords"), dict):
+        internal["keywords"] = {}
+
+    # sms 검증
+    if not isinstance(result.get("sms"), dict):
+        result["sms"] = {"recommended": False, "message": ""}
+
+    sms = result["sms"]
+    if not isinstance(sms.get("recommended"), bool):
+        sms["recommended"] = False
+
+    if not isinstance(sms.get("message"), str):
+        sms["message"] = ""
+
+    # SMS 90자 초과 시 자르기
+    if len(sms["message"]) > 90:
+        sms["message"] = sms["message"][:90]
 
     return result
 
 
+# ── GPT 분석 ──────────────────────────────────────────────────────────────────
 def analyze_with_gpt(call_id: str, transcript: str) -> dict | None:
+
+    # 도메인 스키마를 프롬프트에 포함
+    domain_guide = "\n".join([
+        f"- {domain}: {list(schema.keys())}"
+        for domain, schema in DOMAIN_SCHEMA.items()
+    ])
+
     prompt = f"""다음 통화 내용을 분석해주세요.
 
 통화 내용:
 {transcript}
 
+[도메인 목록 및 키워드 구조]
+{domain_guide}
+
+분석 규칙:
+1. 통화 내용을 보고 도메인을 파악하세요.
+2. 해당 도메인의 키워드 구조에 맞게 정보를 추출하세요.
+3. 키워드는 실제 업종 종사자가 쓰는 용어로 구체적으로 작성하세요.
+4. SMS는 고객이 읽었을 때 바로 이해할 수 있게 작성하세요. (90자 이내)
+5. 예약/상담 완료된 경우에만 SMS recommended를 true로 설정하세요.
+
 아래 JSON 형식으로만 응답하세요. 다른 텍스트 없이 JSON만:
 {{
-  "summary": "통화 내용 3줄 요약",
+  "domain": "미용실/음식점/부동산/병원/네일샵/자동차정비/기타 중 하나",
   "category": "문의/불만/예약/취소/기타 중 하나",
   "sentiment": "positive/neutral/negative 중 하나",
   "action_required": true 또는 false,
-  "keywords": ["키워드1", "키워드2"],
-  "extracted_info": {{
-    "주요_요청": "...",
-    "고객_의도": "..."
+
+  "internal": {{
+    "summary": "소상공인을 위한 통화 내용 3줄 요약",
+    "keywords": {{
+      "키워드항목1": "구체적인 값",
+      "키워드항목2": "구체적인 값",
+      "키워드항목3": "구체적인 값",
+      "키워드항목4": "구체적인 값",
+      "액션": "처리해야 할 것"
+    }}
+  }},
+
+  "sms": {{
+    "recommended": true 또는 false,
+    "message": "고객이 이해하기 쉬운 문자 내용 (90자 이내)"
   }}
 }}"""
+
     try:
         client = openai.OpenAI(api_key=OPENAI_API_KEY, timeout=55.0)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
-            max_tokens=500,
+            max_tokens=800,
         )
         raw = response.choices[0].message.content.strip()
 
-        # JSON 마크다운 펜스 제거 (GPT가 ```json ... ``` 형태로 줄 때 대비)
+        # JSON 마크다운 펜스 제거
         if raw.startswith("```"):
             raw = raw.strip("`").strip()
             if raw.startswith("json"):
@@ -155,7 +246,11 @@ def analyze_with_gpt(call_id: str, transcript: str) -> dict | None:
         # 가드레일 적용
         result = _validate_gpt_result(result)
 
-        logger.info(f"[NLP] GPT 분석 완료 call_id={call_id} category={result['category']}")
+        logger.info(
+            f"[NLP] GPT 분석 완료 call_id={call_id} "
+            f"domain={result['domain']} category={result['category']} "
+            f"sms_recommended={result['sms']['recommended']}"
+        )
         return result
 
     except json.JSONDecodeError as e:
@@ -166,9 +261,7 @@ def analyze_with_gpt(call_id: str, transcript: str) -> dict | None:
         return None
 
 
-
 # ── Lambda 핸들러 ──────────────────────────────────────────────────────────────
-
 def lambda_handler(event: dict, context) -> dict:
     if event.get("call_id") and event.get("transcript"):
         result = analyze_with_gpt(event["call_id"], event["transcript"])
@@ -176,20 +269,15 @@ def lambda_handler(event: dict, context) -> dict:
 
     path   = event.get("path", "")
     method = event.get("httpMethod", "POST")
-    
 
-    # ── 관리자용 강제 리로드 엔드포인트 ──────────────────────────────────────
     if path == "/admin/reload-keywords" and method == "POST":
         return _handle_force_reload(event)
 
-    # ── 일반 NLP 분석 요청 ───────────────────────────────────────────────────
     return _handle_nlp(event)
 
 
 def _handle_force_reload(event: dict) -> dict:
-    """POST /admin/reload-keywords — keywords.json 강제 갱신"""
-    # TODO: 실제 서비스에서는 Admin API Key 헤더 검증 추가
-    headers = event.get("headers", {}) or {}
+    headers   = event.get("headers", {}) or {}
     admin_key = headers.get("x-admin-key", "")
     if admin_key != os.environ.get("ADMIN_KEY", ""):
         return _response(403, {"error": "Forbidden"})
@@ -203,7 +291,6 @@ def _handle_force_reload(event: dict) -> dict:
 
 
 def _handle_nlp(event: dict) -> dict:
-    """POST /nlp — 통화 텍스트 키워드 분석"""
     try:
         body = json.loads(event.get("body") or "{}")
         text = body.get("text", "").strip()
