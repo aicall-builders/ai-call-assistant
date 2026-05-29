@@ -370,6 +370,9 @@ def lambda_handler(event: dict, context) -> dict:
         return _handle_call_delete(event, call_id)
     if path == "/calls/upload" and method == "POST":
         return _handle_upload(event)
+    if path and path.startswith("/calls/") and path.endswith("/sms") and method == "POST":
+        call_id = path.split("/")[2]
+        return _handle_sms_send(event, call_id)
 
     return _response(404, {"error": "Not found"}, event)
 
@@ -571,6 +574,57 @@ def _handle_call_process(event: dict, call_id: str) -> dict:
     except Exception as e:
         logger.exception(f"[Call] process 오류: {e}")
         return _response(500, {"error": "내부 오류"}, event)
+
+def _handle_sms_send(event: dict, call_id: str) -> dict:
+    """
+    POST /calls/{callId}/sms
+    소상공인이 직접 문자 발송 선택
+    body: { "message": "수정된 문자 내용" } (선택사항 — 없으면 AI 생성 메시지 사용)
+    """
+    uid = _get_uid(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"}, event)
+
+    try:
+        # 통화 정보 조회
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT c.caller_number, s.sms_message
+                    FROM calls c
+                    LEFT JOIN summaries s ON s.call_id = c.id
+                    WHERE c.id = %s AND c.user_id = %s
+                """, (call_id, uid))
+                row = cur.fetchone()
+
+        if not row:
+            return _response(404, {"error": "통화를 찾을 수 없습니다"}, event)
+
+        caller_number = row.get("caller_number", "")
+        if not caller_number:
+            return _response(400, {"error": "발신번호가 없습니다"}, event)
+
+        # 사용자가 수정한 메시지 or AI 생성 메시지 사용
+        body    = json.loads(event.get("body") or "{}")
+        message = body.get("message", "").strip() or row.get("sms_message", "")
+
+        if not message:
+            return _response(400, {"error": "문자 내용이 없습니다"}, event)
+
+        # 솔라피 발송
+        from sms_handler import send_sms
+        success = send_sms(caller_number, message)
+
+        if success:
+            logger.info(f"[SMS] 발송 완료 call_id={call_id} to={caller_number}")
+            return _response(200, {"message": "문자 발송 완료"}, event)
+        else:
+            return _response(500, {"error": "문자 발송 실패"}, event)
+
+    except Exception as e:
+        logger.exception(f"[SMS] 발송 오류 call_id={call_id}: {e}")
+        return _response(500, {"error": "내부 오류"}, event)
+
 
 def _handle_upload(event: dict) -> dict:
     uid = _get_uid(event)

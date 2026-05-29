@@ -266,11 +266,7 @@ def analyze_with_gpt(call_id: str, transcript: str) -> dict | None:
 def lambda_handler(event: dict, context) -> dict:
     if event.get("call_id") and event.get("transcript"):
         result = analyze_with_gpt(event["call_id"], event["transcript"])
-
-        # SMS 자동 발송
-        if result and event.get("caller_number"):
-            send_call_summary_sms(event["caller_number"], result)
-
+        # SMS는 소상공인이 직접 선택해서 발송 (자동 발송 제거)
         return {"statusCode": 200, "body": json.dumps(result, ensure_ascii=False)}
 
     path   = event.get("path", "")
