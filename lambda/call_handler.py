@@ -276,6 +276,15 @@ def _invoke_nlp(call_id: str, transcript: str) -> None:
         body = json.loads(payload.get("body", "{}"))
         if body:
             _insert_summary(call_id, body)
+            # NLP가 추출한 발신번호 저장
+            phone = (body.get("customer", {}).get("phone") or "").strip()
+            if phone:
+                with get_db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE calls SET caller_number = %s WHERE id = %s", (phone, call_id))
+                    conn.commit()
+            # 요약까지 완료 → 상태 업데이트
+            _update_call_status(call_id, status="completed")
         logger.info(f"[NLP] 분석 및 저장 완료 call_id={call_id}")
     except Exception as e:
         logger.error(f"[NLP] invoke 실패 call_id={call_id}: {e}")

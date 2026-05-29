@@ -174,6 +174,15 @@ def _validate_gpt_result(result: dict) -> dict:
     # SMS 90자 초과 시 자르기
     if len(sms["message"]) > 90:
         sms["message"] = sms["message"][:90]
+        
+    # customer 검증  ← 여기부터 추가
+    if not isinstance(result.get("customer"), dict):
+        result["customer"] = {}
+    cust = result["customer"]
+    cust["name"]  = cust.get("name", "")  if isinstance(cust.get("name"), str)  else ""
+    cust["phone"] = cust.get("phone", "") if isinstance(cust.get("phone"), str) else ""
+    cust["phone"] = "".join(ch for ch in cust["phone"] if ch.isdigit())  # 숫자만
+    # ← 여기까지    
 
     return result
 
@@ -208,6 +217,11 @@ def analyze_with_gpt(call_id: str, transcript: str) -> dict | None:
   "category": "문의/불만/예약/취소/기타 중 하나",
   "sentiment": "positive/neutral/negative 중 하나",
   "action_required": true 또는 false,
+  
+  "customer": {{
+    "name": "고객 성함 (언급 없으면 빈 문자열)",
+    "phone": "고객 연락처, 숫자만 (예: 01012345678, 언급 없으면 빈 문자열)"
+  }},
 
   "internal": {{
     "summary": "소상공인을 위한 통화 내용 3줄 요약",
