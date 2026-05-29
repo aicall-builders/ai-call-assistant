@@ -494,7 +494,15 @@ def _handle_call_get(event: dict, call_id: str) -> dict:
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT * FROM calls WHERE id = %s AND user_id = %s", (call_id, uid))
+                cur.execute("""
+                    SELECT c.*,
+                           s.summary, s.category, s.domain, s.sentiment,
+                           s.action_required, s.keywords, s.internal_keywords,
+                           s.extracted_info, s.sms_recommended, s.sms_message
+                    FROM calls c
+                    LEFT JOIN summaries s ON s.call_id = c.id
+                    WHERE c.id = %s AND c.user_id = %s
+                """, (call_id, uid))
                 call = cur.fetchone()
         if not call:
             return _response(404, {"error": "통화를 찾을 수 없습니다"}, event)
