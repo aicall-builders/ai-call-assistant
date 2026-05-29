@@ -135,22 +135,22 @@ def request_clova_stt(call_id: str, s3_key: str) -> str | None:
     body = {
         "url":      presigned_url,
         "language": "ko-KR",
-        "completion": "async",
+        "completion": "sync",      # async → sync: 콜백/OBS 없이 결과 바로 받음
     }
     try:
         resp = requests.post(
             f"{CLOVA_API_URL}/recognizer/url",
-            headers=headers, json=body, timeout=10,
+            headers=headers, json=body, timeout=120,   # sync는 인식 끝날 때까지 대기
         )
         if not resp.ok:
             logger.error(f"[CLOVA] {resp.status_code} 본문: {resp.text}")
             raise ValueError(f"CLOVA {resp.status_code}: {resp.text}")
-        job_id = resp.json().get("token")
-        if not job_id:
-            raise ValueError(f"CLOVA 응답에 token 없음: {resp.text}")
-        _update_call_status(call_id, status="processing", clova_job_id=job_id)
-        logger.info(f"[CLOVA] STT 요청 완료 call_id={call_id} job_id={job_id}")
-        return job_id
+        data = resp.json()
+        transcript = _extract_transcript(data)
+        _update_call_status(call_id, status="transcribed", stt_result=transcript)
+        logger.info(f"[CLOVA] STT 완료(sync) call_id={call_id} len={len(transcript)}")
+        _invoke_nlp(call_id, transcript)          # 바로 NLP 호출 → 요약 저장
+        return call_id
     except Exception as e:
         logger.error(f"[CLOVA] STT 요청 실패 call_id={call_id}: {e}")
         _update_call_status(call_id, status="error", error_message=str(e))
