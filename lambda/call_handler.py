@@ -142,7 +142,9 @@ def request_clova_stt(call_id: str, s3_key: str) -> str | None:
             f"{CLOVA_API_URL}/recognizer/url",
             headers=headers, json=body, timeout=10,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            logger.error(f"[CLOVA] {resp.status_code} 본문: {resp.text}")
+            raise ValueError(f"CLOVA {resp.status_code}: {resp.text}")
         job_id = resp.json().get("token")
         if not job_id:
             raise ValueError(f"CLOVA 응답에 token 없음: {resp.text}")
