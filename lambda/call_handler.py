@@ -252,10 +252,23 @@ def _extract_transcript(data: dict) -> str:
 
 def _invoke_nlp(call_id: str, transcript: str) -> None:
     try:
+        # 통화 정보에서 caller_number 조회
+        caller_number = ""
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT caller_number FROM calls WHERE id = %s", (call_id,))
+                row = cur.fetchone()
+                if row:
+                    caller_number = row.get("caller_number", "")
+
         response = lambda_client.invoke(
             FunctionName="call-recorder-api-nlp",
             InvocationType="RequestResponse",
-            Payload=json.dumps({"call_id": call_id, "transcript": transcript}).encode(),
+            Payload=json.dumps({
+                "call_id": call_id,
+                "transcript": transcript,
+                "caller_number": caller_number,
+            }).encode(),
         )
         payload = json.loads(response["Payload"].read())
         body = json.loads(payload.get("body", "{}"))
@@ -444,9 +457,8 @@ def _handle_calls_list(event: dict) -> dict:
         offset   = int(params.get("offset", 0))
         sql = """
             SELECT c.*,
-                   s.summary, s.category, s.domain, s.sentiment,
-                   s.action_required, s.keywords, s.internal_keywords,
-                   s.extracted_info, s.sms_recommended, s.sms_message
+                   s.summary, s.category, s.sentiment,
+                   s.action_required, s.keywords, s.extracted_info
             FROM calls c
             LEFT JOIN summaries s ON s.call_id = c.id
             WHERE c.user_id = %s
