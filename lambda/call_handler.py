@@ -268,23 +268,31 @@ def _invoke_nlp(call_id: str, transcript: str) -> None:
 def _insert_summary(call_id: str, result: dict) -> None:
     sql = """
         INSERT INTO summaries
-            (id, call_id, summary, category, sentiment,
-             action_required, keywords, extracted_info)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            (id, call_id, summary, category, domain, sentiment,
+             action_required, keywords, internal_keywords,
+             extracted_info, sms_recommended, sms_message)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
+    internal = result.get("internal", {})
+    sms      = result.get("sms", {})
+
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, (
                 str(uuid.uuid4()), call_id,
-                result.get("summary", ""),
+                internal.get("summary", result.get("summary", "")),
                 result.get("category", "기타"),
+                result.get("domain", "기타"),
                 result.get("sentiment", "neutral"),
                 1 if result.get("action_required") else 0,
                 json.dumps(result.get("keywords", []), ensure_ascii=False),
+                json.dumps(internal.get("keywords", {}), ensure_ascii=False),
                 json.dumps(result.get("extracted_info", {}), ensure_ascii=False),
+                1 if sms.get("recommended") else 0,
+                sms.get("message", ""),
             ))
         conn.commit()
-    logger.info(f"[Call] summaries INSERT 완료 call_id={call_id}")
+    logger.info(f"[Call] summaries INSERT 완료 call_id={call_id} domain={result.get('domain', '기타')}")
 
 def _update_call_status(call_id: str, *, status: str,
                          clova_job_id: str = None,
