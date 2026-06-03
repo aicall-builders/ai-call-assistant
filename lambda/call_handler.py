@@ -14,10 +14,6 @@ import requests
 from botocore.exceptions import ClientError
 
 from redis_client import set_nx_with_ttl, cache_get, cache_set, TTL_UPLOAD_LOCK
-<<<<<<< Updated upstream
-from calendar_handler import handle_calendar_request
-=======
->>>>>>> Stashed changes
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -30,29 +26,8 @@ CLOVA_SPEECH_INVOKE_URL = os.environ.get("CLOVA_SPEECH_INVOKE_URL") or os.enviro
 CLOVA_SPEECH_SECRET_KEY = os.environ.get("CLOVA_SPEECH_SECRET_KEY") or os.environ.get("CLOVA_SECRET_KEY", "")
 
 
-<<<<<<< Updated upstream
-ALLOWED_ORIGINS = [
-    "https://dk1k75g0ji3vw.cloudfront.net",
-    "http://localhost:3000",
-]
-
-def _response(status: int, body: dict, event: dict = {}) -> dict:
-    request_origin = (event.get("headers") or {}).get("origin", "")
-    cors_origin = request_origin if request_origin in ALLOWED_ORIGINS else ALLOWED_ORIGINS[0]
-    return {
-        "statusCode": status,
-        "headers": {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": cors_origin,
-            "Access-Control-Allow-Headers": "Content-Type,Authorization",
-            "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
-        },
-        "body": json.dumps(body, ensure_ascii=False),
-    }
-=======
 STT_MAX_RETRY_COUNT = int(os.environ.get("STT_MAX_RETRY", 3))
 STT_STALE_MINUTES = int(os.environ.get("STT_STALE_MINUTES", 5))
->>>>>>> Stashed changes
 
 def _get_db_password() -> str:
     secret_id = os.environ.get("DB_SECRET_ARN") or os.environ.get("DB_SECRET_NAME") or ""
@@ -164,29 +139,19 @@ def request_clova_stt(call_id: str, s3_key: str) -> str | None:
 
     try:
         resp = requests.post(
-<<<<<<< Updated upstream
-            f"{CLOVA_API_URL}/recognizer/url",
-=======
             f"{CLOVA_SPEECH_INVOKE_URL}/recognizer/url",
->>>>>>> Stashed changes
             headers=headers, json=body, timeout=10,
         )
         resp.raise_for_status()
         job_id = resp.json().get("token")
         if not job_id:
             raise ValueError(f"CLOVA 응답에 token 없음: {resp.text}")
-<<<<<<< Updated upstream
-        _update_call_status(call_id, status="processing", clova_job_id=job_id)
-        logger.info(f"[CLOVA] STT 요청 완료 call_id={call_id} job_id={job_id}")
-        return job_id
-=======
 
         # DB 업데이트
         _update_call_status(call_id, status="processing", clova_job_id=job_id)
         logger.info(f"[CLOVA] STT 요청 완료 call_id={call_id} job_id={job_id}")
         return job_id
 
->>>>>>> Stashed changes
     except Exception as e:
         logger.error(f"[CLOVA] STT 요청 실패 call_id={call_id}: {e}")
         _update_call_status(call_id, status="error", error_message=str(e))
@@ -331,14 +296,10 @@ def _invoke_nlp(call_id: str, transcript: str) -> None:
         response = lambda_client.invoke(
             FunctionName="call-recorder-api-nlp",
             InvocationType="RequestResponse",
-<<<<<<< Updated upstream
-            Payload=json.dumps({"call_id": call_id, "transcript": transcript}).encode(),
-=======
             Payload=json.dumps({
                 "call_id": call_id,
                 "transcript": transcript,
             }).encode(),
->>>>>>> Stashed changes
         )
         payload = json.loads(response["Payload"].read())
         body = json.loads(payload.get("body", "{}"))
@@ -354,22 +315,14 @@ def _insert_summary(call_id: str, result: dict) -> None:
         INSERT INTO summaries
             (id, call_id, summary, category, sentiment,
              action_required, keywords, extracted_info)
-<<<<<<< Updated upstream
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-=======
         VALUES
             (%s, %s, %s, %s, %s, %s, %s, %s)
->>>>>>> Stashed changes
     """
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, (
-<<<<<<< Updated upstream
-                str(uuid.uuid4()), call_id,
-=======
                 str(uuid.uuid4()),
                 call_id,
->>>>>>> Stashed changes
                 result.get("summary", ""),
                 result.get("category", "기타"),
                 result.get("sentiment", "neutral"),
@@ -379,12 +332,9 @@ def _insert_summary(call_id: str, result: dict) -> None:
             ))
         conn.commit()
     logger.info(f"[Call] summaries INSERT 완료 call_id={call_id}")
-<<<<<<< Updated upstream
-=======
 
 
 # ── DB 업데이트 헬퍼 ──────────────────────────────────────────────────────────
->>>>>>> Stashed changes
 
 def _update_call_status(call_id: str, *, status: str,
                          clova_job_id: str = None,
@@ -476,15 +426,9 @@ def lambda_handler(event: dict, context) -> dict:
     if path == "/stores" and method == "GET":
         return _handle_stores_list(routed_event)
     if path == "/stores" and method == "POST":
-<<<<<<< Updated upstream
-        return _handle_stores_create(event)
-    if path.startswith("/calendar") or (path.startswith("/calls/") and path.endswith("/calendar-events")):
-        return handle_calendar_request(event, context)
-=======
         return _handle_stores_create(routed_event)
 
     # calls
->>>>>>> Stashed changes
     if path == "/calls" and method == "GET":
         return _handle_calls_list(routed_event)
     if path.startswith("/calls/") and path.endswith("/audio") and method == "GET":
@@ -503,11 +447,7 @@ def lambda_handler(event: dict, context) -> dict:
         call_id = path.split("/")[2]
         return _handle_call_delete(routed_event, call_id)
     if path == "/calls/upload" and method == "POST":
-<<<<<<< Updated upstream
-        return _handle_upload(event)
-=======
         return _handle_upload(routed_event)
->>>>>>> Stashed changes
 
     return _response(404, {"error": "Not found", "path": path}, event)
 
@@ -547,11 +487,7 @@ def _handle_stores_list(event: dict) -> dict:
                 )
                 stores = cur.fetchall()
         result = [{k: str(v) if hasattr(v, "isoformat") else v for k, v in s.items()} for s in stores]
-<<<<<<< Updated upstream
-        return _response(200, {"stores": result}, event)
-=======
         return _response(200, {"stores": result})
->>>>>>> Stashed changes
     except Exception as e:
         logger.exception(f"[Store] list 오류: {e}")
         return _response(500, {"error": "내부 오류"})
@@ -583,11 +519,7 @@ def _handle_stores_create(event: dict) -> dict:
 def _handle_calls_list(event: dict) -> dict:
     uid = _get_current_user_id(event)
     if not uid:
-<<<<<<< Updated upstream
-        return _response(401, {"error": "인증 필요"}, event)
-=======
         return _response(401, {"error": "인증 필요"})
->>>>>>> Stashed changes
     try:
         params = event.get("queryStringParameters") or {}
         store_id = params.get("store_id")
@@ -618,11 +550,7 @@ def _handle_calls_list(event: dict) -> dict:
                 cur.execute(sql, values)
                 calls = cur.fetchall()
         result = [{k: str(v) if hasattr(v, "isoformat") else v for k, v in c.items()} for c in calls]
-<<<<<<< Updated upstream
-        return _response(200, {"calls": result}, event)
-=======
         return _response(200, {"calls": result})
->>>>>>> Stashed changes
     except Exception as e:
         logger.exception(f"[Call] list 오류: {e}")
         return _response(500, {"error": "내부 오류"})
@@ -638,15 +566,9 @@ def _handle_call_get(event: dict, call_id: str) -> dict:
                 cur.execute("SELECT * FROM calls WHERE id = %s AND user_id = %s", (call_id, uid))
                 call = cur.fetchone()
         if not call:
-<<<<<<< Updated upstream
-            return _response(404, {"error": "통화를 찾을 수 없습니다"}, event)
-        result = {k: str(v) if hasattr(v, "isoformat") else v for k, v in call.items()}
-        return _response(200, {"call": result}, event)
-=======
             return _response(404, {"error": "통화를 찾을 수 없습니다"})
         result = {k: str(v) if hasattr(v, "isoformat") else v for k, v in call.items()}
         return _response(200, {"call": result})
->>>>>>> Stashed changes
     except Exception as e:
         logger.exception(f"[Call] get 오류: {e}")
         return _response(500, {"error": "내부 오류"})
@@ -726,20 +648,12 @@ def _handle_call_process(event: dict, call_id: str) -> dict:
         return _response(200, {"message": "STT 처리 시작", "clova_job_id": job_id})
     except Exception as e:
         logger.exception(f"[Call] process 오류: {e}")
-<<<<<<< Updated upstream
-        return _response(500, {"error": "내부 오류"}, event)
-=======
         return _response(500, {"error": "내부 오류"})
->>>>>>> Stashed changes
 
 def _handle_upload(event: dict) -> dict:
     uid = _get_current_user_id(event)
     if not uid:
-<<<<<<< Updated upstream
-        return _response(401, {"error": "인증 필요"}, event)
-=======
         return _response(401, {"error": "인증 필요"})
->>>>>>> Stashed changes
     try:
         body        = json.loads(event.get("body") or "{}")
         store_id    = body.get("store_id", "").strip()

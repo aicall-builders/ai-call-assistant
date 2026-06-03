@@ -96,15 +96,7 @@ def set_nx_with_ttl(key, value, ttl):
         logger.warning("[Redis] 중복 체크 불가. Redis 연결 없음 → 통과 처리")
         return True
     try:
-<<<<<<< Updated upstream
-        result = r.set(key, value, nx=True, ex=ttl)
-        return result is True
-    except RedisError as e:
-        logger.warning(f"[Redis] SET NX 실패 key={key}: {e}")
-        return True  # 실패 시 통과 (안전 방향)
-=======
         return r.set(key, value, nx=True, ex=ttl) is True
     except Exception as e:
         logger.warning("[Redis] SET NX 실패 key=%s: %s", key, e)
         return True
->>>>>>> Stashed changes

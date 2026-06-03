@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
 import boto3
+from botocore.config import Config
 import pymysql
 import pymysql.cursors
 import requests
@@ -40,18 +41,48 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 SUPPORTED_OAUTH_PROVIDERS = {"kakao", "google", "naver"}
+AWS_CLIENT_CONFIG = Config(connect_timeout=3, read_timeout=3, retries={"max_attempts": 1})
 
 
-def _init_firebase():
-    if firebase_admin._apps:
-        return
+def _load_firebase_service_account() -> dict:
+    """
+    Firebase Admin SDK 설정을 로드한다.
+
+    우선순위:
+    1. Secrets Manager: FIREBASE_SERVICE_ACCOUNT_SECRET_ARN 또는 FIREBASE_SERVICE_ACCOUNT_SECRET_NAME
+       - SecretString에는 Firebase Admin SDK JSON 원본을 저장한다.
+    2. 환경변수 FIREBASE_SERVICE_ACCOUNT: JSON 문자열
+    3. 환경변수 FIREBASE_SERVICE_ACCOUNT_BASE64: JSON 파일의 base64 문자열
+    """
+    secret_id = (
+        os.environ.get("FIREBASE_SERVICE_ACCOUNT_SECRET_ARN")
+        or os.environ.get("FIREBASE_SERVICE_ACCOUNT_SECRET_NAME")
+        or ""
+    )
+    if secret_id:
+        sm = boto3.client("secretsmanager", region_name=os.environ.get("AWS_REGION", "ap-northeast-2"), config=AWS_CLIENT_CONFIG)
+        secret = sm.get_secret_value(SecretId=secret_id)
+        secret_string = secret.get("SecretString") or ""
+        if not secret_string and secret.get("SecretBinary"):
+            secret_string = base64.b64decode(secret["SecretBinary"]).decode("utf-8")
+        return json.loads(secret_string)
+
     sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "")
     sa_b64 = os.environ.get("FIREBASE_SERVICE_ACCOUNT_BASE64", "")
     if sa_b64:
         sa_json = base64.b64decode(sa_b64).decode("utf-8")
     if not sa_json:
-        raise RuntimeError("FIREBASE_SERVICE_ACCOUNT_BASE64 또는 FIREBASE_SERVICE_ACCOUNT 환경변수가 필요합니다")
-    firebase_admin.initialize_app(credentials.Certificate(json.loads(sa_json)))
+        raise RuntimeError(
+            "Firebase Admin SDK 설정이 없습니다. "
+            "FIREBASE_SERVICE_ACCOUNT_SECRET_NAME 또는 FIREBASE_SERVICE_ACCOUNT_SECRET_ARN을 설정하세요."
+        )
+    return json.loads(sa_json)
+
+
+def _init_firebase():
+    if firebase_admin._apps:
+        return
+    firebase_admin.initialize_app(credentials.Certificate(_load_firebase_service_account()))
 
 
 def _cors_origin(event=None):
@@ -115,14 +146,29 @@ def _method(event):
 
 
 def _json_body(event):
-    raw = event.get("body") or "{}"
-    if event.get("isBase64Encoded"):
-        raw = base64.b64decode(raw).decode("utf-8")
-    try:
-        data = json.loads(raw)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    # API Gateway 설정이 Lambda Proxy가 아니거나 매핑 템플릿이 꼬인 경우
+    # body가 누락될 수 있어 queryStringParameters도 fallback으로 병합한다.
+    data = {}
+    raw = event.get("body")
+    if isinstance(raw, dict):
+        data = raw
+    else:
+        raw = raw or "{}"
+        if event.get("isBase64Encoded"):
+            raw = base64.b64decode(raw).decode("utf-8")
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:
+            data = {}
+
+    query = event.get("queryStringParameters") or {}
+    if query:
+        merged = dict(query)
+        merged.update(data)  # body 값을 우선한다.
+        return merged
+    return data
 
 
 def _query(event):
@@ -133,7 +179,7 @@ def _get_db_password():
     secret_id = os.environ.get("DB_SECRET_ARN") or os.environ.get("DB_SECRET_NAME") or ""
     if secret_id:
         try:
-            sm = boto3.client("secretsmanager", region_name=os.environ.get("AWS_REGION", "ap-northeast-2"))
+            sm = boto3.client("secretsmanager", region_name=os.environ.get("AWS_REGION", "ap-northeast-2"), config=AWS_CLIENT_CONFIG)
             secret = sm.get_secret_value(SecretId=secret_id)
             data = json.loads(secret.get("SecretString") or "{}")
             return data.get("password") or data.get("db_password") or data.get("PASSWORD") or ""
@@ -150,7 +196,9 @@ def get_db():
         db=os.environ.get("DB_NAME", "call_recorder"),
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
-        connect_timeout=5,
+        connect_timeout=3,
+        read_timeout=3,
+        write_timeout=3,
     )
 
 
@@ -521,8 +569,30 @@ def _handle_provider_login(event, provider):
             return _response(400, {"error": "provider access token 발급 실패"}, event)
 
         profile = _fetch_profile(provider, access_token)
-        user = _upsert_user(profile)
+        try:
+            logger.info("[Auth] DB user upsert start provider=%s provider_user_id=%s", provider, profile.get("provider_user_id"))
+            user = _upsert_user(profile)
+            logger.info("[Auth] DB user upsert ok firebase_uid=%s", user.get("firebase_uid"))
+        except Exception as db_error:
+            # API Gateway 29초 제한을 넘기지 않도록 DB 장애/보안그룹 문제는 로그인 자체를 막지 않는다.
+            # uid는 provider:userId 형식으로 유지하므로 추후 DB 복구 후 동일 계정으로 매핑 가능하다.
+            logger.exception("[Auth] DB user upsert failed; issuing Firebase token without DB persist provider=%s", provider)
+            provider_user_id = str(profile.get("provider_user_id") or "")
+            if not provider_user_id:
+                raise
+            user = {
+                "id": f"temporary:{provider}:{provider_user_id}",
+                "firebase_uid": f"{provider}:{provider_user_id}",
+                "provider": provider,
+                "provider_user_id": provider_user_id,
+                "email": profile.get("email") or "",
+                "nickname": profile.get("nickname") or provider,
+                "db_warning": str(db_error),
+            }
+
+        logger.info("[Auth] firebase init start uid=%s", user.get("firebase_uid"))
         _init_firebase()
+        logger.info("[Auth] firebase init ok uid=%s", user.get("firebase_uid"))
         custom_token = firebase_auth.create_custom_token(user["firebase_uid"])
         custom_token_str = custom_token.decode("utf-8") if isinstance(custom_token, bytes) else custom_token
         return _response(200, {

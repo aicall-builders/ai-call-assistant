@@ -42,16 +42,45 @@ logger.setLevel(logging.INFO)
 SUPPORTED_OAUTH_PROVIDERS = {"kakao", "google", "naver"}
 
 
-def _init_firebase():
-    if firebase_admin._apps:
-        return
+def _load_firebase_service_account() -> dict:
+    """
+    Firebase Admin SDK 설정을 로드한다.
+
+    우선순위:
+    1. Secrets Manager: FIREBASE_SERVICE_ACCOUNT_SECRET_ARN 또는 FIREBASE_SERVICE_ACCOUNT_SECRET_NAME
+       - SecretString에는 Firebase Admin SDK JSON 원본을 저장한다.
+    2. 환경변수 FIREBASE_SERVICE_ACCOUNT: JSON 문자열
+    3. 환경변수 FIREBASE_SERVICE_ACCOUNT_BASE64: JSON 파일의 base64 문자열
+    """
+    secret_id = (
+        os.environ.get("FIREBASE_SERVICE_ACCOUNT_SECRET_ARN")
+        or os.environ.get("FIREBASE_SERVICE_ACCOUNT_SECRET_NAME")
+        or ""
+    )
+    if secret_id:
+        sm = boto3.client("secretsmanager", region_name=os.environ.get("AWS_REGION", "ap-northeast-2"))
+        secret = sm.get_secret_value(SecretId=secret_id)
+        secret_string = secret.get("SecretString") or ""
+        if not secret_string and secret.get("SecretBinary"):
+            secret_string = base64.b64decode(secret["SecretBinary"]).decode("utf-8")
+        return json.loads(secret_string)
+
     sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "")
     sa_b64 = os.environ.get("FIREBASE_SERVICE_ACCOUNT_BASE64", "")
     if sa_b64:
         sa_json = base64.b64decode(sa_b64).decode("utf-8")
     if not sa_json:
-        raise RuntimeError("FIREBASE_SERVICE_ACCOUNT_BASE64 또는 FIREBASE_SERVICE_ACCOUNT 환경변수가 필요합니다")
-    firebase_admin.initialize_app(credentials.Certificate(json.loads(sa_json)))
+        raise RuntimeError(
+            "Firebase Admin SDK 설정이 없습니다. "
+            "FIREBASE_SERVICE_ACCOUNT_SECRET_NAME 또는 FIREBASE_SERVICE_ACCOUNT_SECRET_ARN을 설정하세요."
+        )
+    return json.loads(sa_json)
+
+
+def _init_firebase():
+    if firebase_admin._apps:
+        return
+    firebase_admin.initialize_app(credentials.Certificate(_load_firebase_service_account()))
 
 
 def _cors_origin(event=None):
