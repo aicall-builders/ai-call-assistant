@@ -21,17 +21,10 @@ logger.setLevel(logging.INFO)
 
 s3 = boto3.client("s3")
 
-<<<<<<< Updated upstream
-BUCKET_NAME   = os.environ.get("S3_BUCKET", "call-recoder-audio-1017")
-KEYWORDS_KEY  = os.environ.get("KEYWORDS_S3_KEY", "config/keywords.json")
-CACHE_KEY     = "nlp:keywords"          # Redis 키
-CACHE_KEY_HASH = "nlp:keywords:hash"    # S3 ETag 저장 (변경 감지용)
-=======
 S3_BUCKET_NAME = os.environ.get("S3_BUCKET", "call-recoder-audio-1017")
 KEYWORDS_S3_KEY = os.environ.get("KEYWORDS_S3_KEY", "config/keywords.json")
 KEYWORDS_CACHE_KEY = "nlp:keywords"          # Redis 키
 KEYWORDS_CACHE_HASH_KEY = "nlp:keywords:hash"    # S3 ETag 저장 (변경 감지용)
->>>>>>> Stashed changes
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 openai.api_key = OPENAI_API_KEY
@@ -53,11 +46,7 @@ def load_keywords(force_reload: bool = False) -> dict:
         logger.info("[NLP] 강제 리로드: Redis 캐시 삭제")
 
     # 캐시 조회
-<<<<<<< Updated upstream
-    cached = cache_get(CACHE_KEY)
-=======
     cached = cache_get(KEYWORDS_CACHE_KEY)
->>>>>>> Stashed changes
     if cached is not None:
         logger.info("[NLP] keywords 캐시 hit")
         return cached
@@ -69,13 +58,8 @@ def load_keywords(force_reload: bool = False) -> dict:
         keywords = json.loads(response["Body"].read().decode("utf-8"))
         etag = response.get("ETag", "")
 
-<<<<<<< Updated upstream
-        cache_set(CACHE_KEY, keywords, TTL_KEYWORDS)
-        cache_set(CACHE_KEY_HASH, etag, TTL_KEYWORDS)
-=======
         cache_set(KEYWORDS_CACHE_KEY, keywords, TTL_KEYWORDS)
         cache_set(KEYWORDS_CACHE_HASH_KEY, etag, TTL_KEYWORDS)
->>>>>>> Stashed changes
         logger.info(f"[NLP] S3 keywords 로드 완료, ETag={etag}")
         return keywords
 

@@ -3,4 +3,8 @@ pymysql
 requests
 firebase-admin
 openai
+<<<<<<< Updated upstream
 redis>=5.0.0
+=======
+redis==5.0.8
+>>>>>>> Stashed changes
