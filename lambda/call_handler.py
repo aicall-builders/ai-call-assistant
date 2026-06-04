@@ -543,8 +543,8 @@ def _handle_calls_list(event: dict) -> dict:
 
         sql = """
             SELECT c.*,
-                   s.summary, s.category, s.sentiment,
-                   s.action_required, s.keywords, s.extracted_info
+                   s.summary, s.category, s.domain, s.sentiment, 
+                   s.action_required, s.keywords, s.internal_keywords, s.extracted_info
             FROM calls c
             LEFT JOIN summaries s ON s.call_id = c.id
             WHERE c.user_id = %s
