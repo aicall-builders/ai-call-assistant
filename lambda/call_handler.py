@@ -12,7 +12,7 @@ import pymysql
 import pymysql.cursors
 import requests
 from botocore.exceptions import ClientError
-from datetime import datetime, date, timezone
+
 from redis_client import set_nx_with_ttl, cache_get, cache_set, TTL_UPLOAD_LOCK, check_rate_limit
 
 logger = logging.getLogger(__name__)
@@ -46,19 +46,6 @@ def _response(status: int, body: dict, event: dict = {}) -> dict:
         },
         "body": json.dumps(body, ensure_ascii=False),
     }
-
-def _serialize_row(row: dict) -> dict:
-    out = {}
-    for k, v in row.items():
-        if isinstance(v, datetime):
-            if v.tzinfo is None:
-                v = v.replace(tzinfo=timezone.utc)
-            out[k] = v.isoformat()
-        elif isinstance(v, date):
-            out[k] = v.isoformat()
-        else:
-            out[k] = v
-    return out
 
 def _get_db_password() -> str:
     secret_name = os.environ.get("DB_SECRET_NAME", "")
@@ -438,7 +425,7 @@ def _handle_stores_list(event: dict) -> dict:
                     (uid,)
                 )
                 stores = cur.fetchall()
-        result = [_serialize_row(s) for s in stores] 
+        result = [{k: str(v) if hasattr(v, "isoformat") else v for k, v in s.items()} for s in stores]
         return _response(200, {"stores": result}, event)
     except Exception as e:
         logger.exception(f"[Store] list 오류: {e}")
@@ -503,7 +490,7 @@ def _handle_calls_list(event: dict) -> dict:
             with conn.cursor() as cur:
                 cur.execute(sql, values)
                 calls = cur.fetchall()
-        result = [_serialize_row(c) for c in calls]  
+        result = [{k: str(v) if hasattr(v, "isoformat") else v for k, v in c.items()} for c in calls]
         return _response(200, {"calls": result}, event)
     except Exception as e:
         logger.exception(f"[Call] list 오류: {e}")
@@ -528,7 +515,7 @@ def _handle_call_get(event: dict, call_id: str) -> dict:
                 call = cur.fetchone()
         if not call:
             return _response(404, {"error": "통화를 찾을 수 없습니다"}, event)
-        result = _serialize_row(call)
+        result = {k: str(v) if hasattr(v, "isoformat") else v for k, v in call.items()}
         return _response(200, {"call": result}, event)
     except Exception as e:
         logger.exception(f"[Call] get 오류: {e}")
