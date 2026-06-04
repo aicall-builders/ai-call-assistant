@@ -136,11 +136,13 @@ def request_clova_stt(call_id: str, s3_key: str) -> str | None:
         "X-CLOVASPEECH-API-KEY": CLOVA_SPEECH_SECRET_KEY,
         "Content-Type":          "application/json",
     }
+    
     body = {
         "url":        presigned_url,
         "language":   "ko-KR",
         "completion": "sync",
-    }
+        "diarization": {"enable": True},
+        }
 
     try:
         resp = requests.post(
