@@ -16,6 +16,8 @@ build/
 
 # 테스트 캐시
 .pytest_cache/
+*.py[cod]
+.pytest_cache/
 
 # 데이터베이스
 *.db
@@ -44,3 +46,5 @@ firebase-adminsdk-*.json
 lambda/dist/
 lambda/package/
 lambda/*.zip
+lambda/__pycache__/
+lambda/zipcheck/

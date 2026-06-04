@@ -16,16 +16,15 @@ except Exception as import_error:
     RedisConnectionError = Exception
     logger.warning("[Redis] redis 패키지 없음. 캐시 없이 진행: %s", import_error)
 
-REDIS_HOST     = os.environ.get("REDIS_HOST", "localhost")
-REDIS_PORT     = int(os.environ.get("REDIS_PORT", 6379))
+REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD")
-REDIS_SSL      = os.environ.get("REDIS_SSL", "true").lower() in {"1", "true", "yes", "y"}
+REDIS_SSL = os.environ.get("REDIS_SSL", "true").lower() in {"1", "true", "yes", "y"}
 
-# TTL 상수 (초)
-TTL_KEYWORDS       = 3600   # keywords.json 캐시: 1시간
-TTL_FIREBASE_TOKEN = 3300   # Firebase 토큰 검증 결과: 55분
-TTL_USER_INFO      = 300    # 유저 DB 조회: 5분
-TTL_UPLOAD_LOCK    = 600    # 중복 업로드 락: 10분
+TTL_KEYWORDS = 3600
+TTL_FIREBASE_TOKEN = 3300
+TTL_USER_INFO = 300
+TTL_UPLOAD_LOCK = 600
 
 _client = None
 
@@ -101,33 +100,3 @@ def set_nx_with_ttl(key, value, ttl):
     except Exception as e:
         logger.warning("[Redis] SET NX 실패 key=%s: %s", key, e)
         return True
-
-
-def check_rate_limit(user_id: str, action: str) -> tuple[bool, int]:
-    """
-    Rate limiting check.
-    Returns (allowed: bool, remaining: int)
-    Redis 없으면 항상 허용 (안전 방향).
-    """
-    r = get_redis()
-    if r is None:
-        return True, 999
-
-    limits = {
-        "upload": (10, 60),   # 10회 per 60초
-        "api":    (60, 60),   # 60회 per 60초
-    }
-    max_count, window = limits.get(action, (30, 60))
-    key = f"rate:{action}:{user_id}"
-
-    try:
-        pipe  = r.pipeline()
-        pipe.incr(key)
-        pipe.expire(key, window)
-        results   = pipe.execute()
-        count     = results[0]
-        remaining = max(0, max_count - count)
-        return count <= max_count, remaining
-    except Exception as e:
-        logger.warning("[Redis] Rate limit 체크 실패 key=%s: %s", key, e)
-        return True, 999

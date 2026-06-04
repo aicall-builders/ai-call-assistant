@@ -14,17 +14,17 @@ import openai
 
 from botocore.exceptions import ClientError
 from redis_client import cache_get, cache_set, cache_delete, TTL_KEYWORDS
-from sms_handler import send_call_summary_sms
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 s3 = boto3.client("s3")
 
-BUCKET_NAME    = os.environ.get("S3_BUCKET", "call-recoder-audio-1017")
-KEYWORDS_KEY   = os.environ.get("KEYWORDS_S3_KEY", "config/keywords.json")
-CACHE_KEY      = "nlp:keywords"
-CACHE_KEY_HASH = "nlp:keywords:hash"
+S3_BUCKET_NAME = os.environ.get("S3_BUCKET", "call-recoder-audio-1017")
+KEYWORDS_S3_KEY = os.environ.get("KEYWORDS_S3_KEY", "config/keywords.json")
+KEYWORDS_CACHE_KEY = "nlp:keywords"
+KEYWORDS_CACHE_HASH_KEY = "nlp:keywords:hash"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 openai.api_key = OPENAI_API_KEY
 
@@ -90,22 +90,23 @@ VALID_SENTIMENTS = {"positive", "neutral", "negative"}
 # ── keywords 로딩 ──────────────────────────────────────────────────────────────
 def load_keywords(force_reload: bool = False) -> dict:
     if force_reload:
-        cache_delete(CACHE_KEY)
-        cache_delete(CACHE_KEY_HASH)
+        cache_delete(KEYWORDS_CACHE_KEY)
+        cache_delete(KEYWORDS_CACHE_HASH_KEY)
         logger.info("[NLP] 강제 리로드: Redis 캐시 삭제")
 
-    cached = cache_get(CACHE_KEY)
+    # 캐시 조회
+    cached = cache_get(KEYWORDS_CACHE_KEY)
     if cached is not None:
         logger.info("[NLP] keywords 캐시 hit")
         return cached
 
     logger.info("[NLP] keywords 캐시 miss → S3 조회")
     try:
-        response = s3.get_object(Bucket=BUCKET_NAME, Key=KEYWORDS_KEY)
+        response = s3.get_object(Bucket=S3_BUCKET_NAME, Key=KEYWORDS_S3_KEY)
         keywords = json.loads(response["Body"].read().decode("utf-8"))
         etag = response.get("ETag", "")
-        cache_set(CACHE_KEY, keywords, TTL_KEYWORDS)
-        cache_set(CACHE_KEY_HASH, etag, TTL_KEYWORDS)
+        cache_set(KEYWORDS_CACHE_KEY, keywords, TTL_KEYWORDS)
+        cache_set(KEYWORDS_CACHE_HASH_KEY, etag, TTL_KEYWORDS)
         logger.info(f"[NLP] S3 keywords 로드 완료, ETag={etag}")
         return keywords
     except ClientError as e:
