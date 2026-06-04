@@ -272,9 +272,33 @@ def _poll_clova(call_id: str, job_id: str, retry_count: int) -> bool:
 
 def _extract_transcript(data: dict) -> str:
     segments = data.get("segments", [])
-    if segments:
-        return " ".join(seg.get("text", "") for seg in segments).strip()
-    return data.get("text", "")
+    if not segments:
+        return data.get("text", "")
+
+    lines = []
+    current_speaker = None
+    current_texts = []
+
+    for seg in segments:
+        speaker = seg.get("speaker", {})
+        label = speaker.get("label") if isinstance(speaker, dict) else None
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        if label:
+            if label != current_speaker:
+                if current_texts:
+                    lines.append(f"[화자{current_speaker}]: {' '.join(current_texts)}")
+                    current_texts = []
+                current_speaker = label
+            current_texts.append(text)
+        else:
+            lines.append(text)
+
+    if current_texts and current_speaker:
+        lines.append(f"[화자{current_speaker}]: {' '.join(current_texts)}")
+
+    return '\n'.join(lines) if lines else data.get("text", "")
 
 
 def _invoke_nlp(call_id: str, transcript: str) -> None:
