@@ -9,7 +9,6 @@ jobs:
   deploy-auth:
     name: Deploy auth_handler
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,11 +18,11 @@ jobs:
       - name: Check if auth_handler changed
         id: check_auth
         run: |
-         if git diff --name-only HEAD~1 HEAD | grep -qE "lambda/auth_handler.py|lambda/requirements.txt|lambda/redis_client.py"; then
-           echo "changed=true" >> $GITHUB_OUTPUT
-         else
-           echo "changed=false" >> $GITHUB_OUTPUT
-         fi
+          if git diff --name-only HEAD~1 HEAD | grep -qE "lambda/auth_handler.py|lambda/requirements.txt|lambda/redis_client.py"; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Configure AWS credentials
         if: steps.check_auth.outputs.changed == 'true'
@@ -50,7 +49,6 @@ jobs:
   deploy-call:
     name: Deploy call_handler
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -60,12 +58,12 @@ jobs:
       - name: Check if call_handler changed
         id: check_call
         run: |
-          if git diff --name-only HEAD~1 HEAD | grep -qE "lambda/call_handler.py|lambda/keywords.json|lambda/requirements.txt|lambda/redis_client.py|lambda/sms_handler.py"; then
+          if git diff --name-only HEAD~1 HEAD | grep -qE "lambda/call_handler.py|lambda/keywords.json|lambda/requirements.txt|lambda/redis_client.py"; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
           fi
-          
+
       - name: Configure AWS credentials
         if: steps.check_call.outputs.changed == 'true'
         uses: aws-actions/configure-aws-credentials@v4
@@ -79,7 +77,7 @@ jobs:
         run: |
           cd lambda
           pip install -r requirements.txt -t package/
-          cp call_handler.py keywords.json redis_client.py sms_handler.py package/
+          cp call_handler.py keywords.json redis_client.py package/
           cd package
           zip -r ../call_handler.zip .
           cd ..
@@ -91,7 +89,6 @@ jobs:
   deploy-nlp:
     name: Deploy nlp_handler
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -100,8 +97,12 @@ jobs:
 
       - name: Check if nlp_handler changed
         id: check_nlp
-        run: echo "changed=true" >> $GITHUB_OUTPUT
-
+        run: |
+          if git diff --name-only HEAD~1 HEAD | grep -qE "lambda/nlp_handler.py|lambda/keywords.json|lambda/requirements.txt|lambda/redis_client.py"; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Configure AWS credentials
         if: steps.check_nlp.outputs.changed == 'true'
@@ -116,7 +117,7 @@ jobs:
         run: |
           cd lambda
           pip install -r requirements.txt -t package/
-          cp nlp_handler.py keywords.json redis_client.py sms_handler.py package/
+          cp nlp_handler.py keywords.json redis_client.py package/
           cd package
           zip -r ../nlp_handler.zip .
           cd ..
@@ -124,3 +125,43 @@ jobs:
             --function-name call-recorder-api-nlp \
             --zip-file fileb://nlp_handler.zip
           echo "✅ nlp_handler 배포 완료"
+
+  deploy-calendar:
+    name: Deploy calendar_handler
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check if calendar_handler changed
+        id: check_calendar
+        run: |
+          if git diff --name-only HEAD~1 HEAD | grep -qE "lambda/calendar_handler.py|lambda/requirements.txt|lambda/redis_client.py"; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure AWS credentials
+        if: steps.check_calendar.outputs.changed == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy calendar_handler to Lambda
+        if: steps.check_calendar.outputs.changed == 'true'
+        run: |
+          cd lambda
+          pip install -r requirements.txt -t package/
+          cp calendar_handler.py redis_client.py package/
+          cd package
+          zip -r ../calendar_handler.zip .
+          cd ..
+          aws lambda update-function-code \
+            --function-name call-recorder-api-calendar \
+            --zip-file fileb://calendar_handler.zip
+          echo "✅ calendar_handler 배포 완료"
