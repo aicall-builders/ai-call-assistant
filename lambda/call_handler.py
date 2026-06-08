@@ -724,8 +724,9 @@ def _handle_upload(event: dict) -> dict:
         if not store_id:
             return _response(400, {"error": "store_id 필수"})
 
-        call_id = str(uuid.uuid4())
-        s3_key  = f"recordings/{store_id}/{call_id}/{file_name}"
+        call_id          = str(uuid.uuid4())
+        s3_key           = f"recordings/{store_id}/{call_id}/{file_name}"
+        counterpart_number = body.get("counterpart_number", "").strip()  # ← 추가
 
         upload_url = s3.generate_presigned_url(
             "put_object",
@@ -738,12 +739,12 @@ def _handle_upload(event: dict) -> dict:
         )
 
         sql = """
-            INSERT INTO calls (id, store_id, user_id, s3_key, status)
-            VALUES (%s, %s, %s, %s, 'uploaded')
+            INSERT INTO calls (id, store_id, user_id, s3_key, status, caller_number)
+            VALUES (%s, %s, %s, %s, 'uploaded', %s)
         """
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (call_id, store_id, uid, s3_key))
+                cur.execute(sql, (call_id, store_id, uid, s3_key, counterpart_number))  # ← 추가
             conn.commit()
 
         return _response(200, {
