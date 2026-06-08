@@ -330,6 +330,7 @@ def _invoke_nlp(call_id: str, transcript: str) -> None:
                     with conn.cursor() as cur:
                         cur.execute("UPDATE calls SET caller_number = %s WHERE id = %s", (phone, call_id))
                     conn.commit()
+            _upsert_caller_stats(call_id) 
             _update_call_status(call_id, status="completed")
         logger.info(f"[NLP] 분석 및 저장 완료 call_id={call_id}")
     except Exception as e:
@@ -434,6 +435,9 @@ def _event_with_path(event: dict, path: str, method: str) -> dict:
 # ── Lambda 핸들러 ─────────────────────────────────────────────────────────────
 
 def lambda_handler(event: dict, context) -> dict:
+    if event.get("action") == "migrate_caller_stats": 
+        return _migrate_caller_stats()
+        
     path   = _normalize_path(event)
     method = _method(event)
 
@@ -766,6 +770,73 @@ def _cors_origin(event=None):
     if origin.startswith("http://localhost") or origin.startswith("http://127.0.0.1"):
         return origin
     return allowed[0]
+
+def _migrate_caller_stats() -> dict:
+    sql = """
+        CREATE TABLE IF NOT EXISTS caller_stats (
+            id              VARCHAR(36)  NOT NULL PRIMARY KEY,
+            user_id         VARCHAR(36)  NOT NULL,
+            store_id        VARCHAR(36)  NOT NULL,
+            caller_number   VARCHAR(20)  NOT NULL,
+            call_count      INT          NOT NULL DEFAULT 1,
+            last_called_at  DATETIME     NOT NULL DEFAULT NOW(),
+            first_called_at DATETIME     NOT NULL DEFAULT NOW(),
+            updated_at      DATETIME     NOT NULL DEFAULT NOW()
+                            ON UPDATE NOW(),
+            UNIQUE KEY uq_user_store_caller (user_id, store_id, caller_number),
+            INDEX idx_user_id (user_id),
+            INDEX idx_caller_number (caller_number)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        conn.commit()
+    logger.info("[Migrate] caller_stats 테이블 생성 완료")
+    return {
+        "statusCode": 200,
+        "body": json.dumps({"message": "caller_stats 테이블 생성 완료"})
+    }
+
+
+def _upsert_caller_stats(call_id: str) -> None:
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT user_id, store_id, caller_number FROM calls WHERE id = %s",
+                    (call_id,)
+                )
+                row = cur.fetchone()
+
+        if not row or not row.get("caller_number"):
+            logger.warning(f"[Stats] caller_number 없음 call_id={call_id}")
+            return
+
+        user_id       = row["user_id"]
+        store_id      = row["store_id"]
+        caller_number = row["caller_number"]
+
+        sql = """
+            INSERT INTO caller_stats
+                (id, user_id, store_id, caller_number,
+                 call_count, last_called_at, first_called_at)
+            VALUES
+                (%s, %s, %s, %s, 1, NOW(), NOW())
+            ON DUPLICATE KEY UPDATE
+                call_count     = call_count + 1,
+                last_called_at = NOW()
+        """
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (
+                    str(uuid.uuid4()), user_id, store_id, caller_number
+                ))
+            conn.commit()
+        logger.info(f"[Stats] 누적 완료 caller={caller_number} user={user_id}")
+
+    except Exception as e:
+        logger.error(f"[Stats] caller_stats 업데이트 실패: {e}")
 
 
 def _response(status: int, body: dict, event: dict = None) -> dict:
