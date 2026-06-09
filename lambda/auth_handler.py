@@ -408,16 +408,22 @@ def _exchange_code(provider, code, redirect_uri, state=None):
 def _fetch_profile(provider, access_token):
     if provider == "google":
         res = requests.get(
-            "https://openidconnect.googleapis.com/v1/userinfo",
-            headers={"Authorization": f"Bearer {access_token}"},
+            "https://oauth2.googleapis.com/tokeninfo",
+            params={"id_token": access_token},
             timeout=10,
         )
         if res.status_code >= 400:
-            raise RuntimeError(f"Google 사용자 정보 조회 실패: HTTP {res.status_code} {res.text[:300]}")
+            res = requests.get(
+                "https://openidconnect.googleapis.com/v1/userinfo",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=10,
+            )
+            if res.status_code >= 400:
+                raise RuntimeError(f"Google 사용자 정보 조회 실패: HTTP {res.status_code} {res.text[:300]}")
         data = res.json()
         return {
             "provider": "google",
-            "provider_user_id": str(data.get("sub") or ""),
+            "provider_user_id": str(data.get("sub") or data.get("user_id") or ""),
             "email": data.get("email") or "",
             "nickname": data.get("name") or data.get("email") or "Google 사용자",
         }
