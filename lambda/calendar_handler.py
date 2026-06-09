@@ -113,7 +113,9 @@ def _require_user(event):
                 cur.execute("SELECT id FROM users WHERE firebase_uid=%s LIMIT 1", (firebase_uid,))
                 row = cur.fetchone()
         if not row:
-            return None, _response(404, {"error": "사용자를 찾을 수 없습니다"}, event)
+            # DB에 없으면 firebase_uid를 user_id로 임시 사용
+            logger.warning("[Calendar] 사용자 DB 미등록 firebase_uid=%s", firebase_uid)
+            return firebase_uid, None
         return row["id"], None
     except Exception as e:
         logger.exception("[Calendar] 사용자 조회 실패: %s", e)
