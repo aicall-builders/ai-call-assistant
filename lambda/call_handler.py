@@ -413,6 +413,10 @@ def _normalize_path(event: dict) -> str:
         path = path[len(stage) + 1:]
     elif stage and path == f"/{stage}":
         path = "/"
+    # 앞에 / 없으면 추가
+    if not path.startswith("/"):
+        path = "/" + path
+    logger.info(f"[Route] path={path} stage={stage}")
     return path or "/"
 
 
