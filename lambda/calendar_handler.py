@@ -458,30 +458,62 @@ def _list_connections(event, user_id):
         logger.warning("[Calendar] list connections fallback empty due schema error: %s", e)
         return _response(200, {"connections": [], "warning": "calendar_connections schema fallback"}, event)
 
+"""
+calendar_handler.py 패치 — 월 범위 조회 지원
+==============================================
+
+기존 _list_calendar_events 함수를 아래 버전으로 통째로 교체하세요.
+
+변경점:
+- date 단일 조회 + from/to 범위 조회 둘 다 지원
+- from/to 있으면 그 범위, 없으면 date(기본 오늘) 하루
+- 응답에 각 이벤트의 start_at(전체 날짜시간) 포함 → 앱에서 day 파싱
+"""
+
 def _list_calendar_events(event, user_id):
     """
-    GET /calendar/events?date=YYYY-MM-DD&limit=10
- 
-    calendar_events 테이블에서 특정 날짜 일정 반환.
-    date 없으면 오늘(서울 기준).
+    GET /calendar/events
+        ?date=YYYY-MM-DD            (하루)
+        ?from=YYYY-MM-DD&to=YYYY-MM-DD  (범위, 월 전체 조회용)
+        &limit=100
+
+    from/to 가 있으면 범위 조회, 없으면 date(기본 오늘) 하루 조회.
     """
     params = _query(event)
- 
-    date_str = params.get("date") or datetime.now(SEOUL_TIMEZONE).strftime("%Y-%m-%d")
+
+    date_from = params.get("from")
+    date_to   = params.get("to")
+    single    = params.get("date")
+
+    # 범위 모드 vs 단일 모드 결정
+    if date_from and date_to:
+        try:
+            d_from = datetime.strptime(date_from, "%Y-%m-%d").date()
+            d_to   = datetime.strptime(date_to,   "%Y-%m-%d").date()
+        except ValueError:
+            return _response(400, {"error": "from/to 형식은 YYYY-MM-DD"}, event)
+        where_clause = "DATE(ce.start_at) BETWEEN %s AND %s"
+        where_args = (d_from.strftime("%Y-%m-%d"), d_to.strftime("%Y-%m-%d"))
+        resp_date = f"{date_from}~{date_to}"
+    else:
+        date_str = single or datetime.now(SEOUL_TIMEZONE).strftime("%Y-%m-%d")
+        try:
+            d_single = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            return _response(400, {"error": "date 형식은 YYYY-MM-DD"}, event)
+        where_clause = "DATE(ce.start_at) = %s"
+        where_args = (d_single.strftime("%Y-%m-%d"),)
+        resp_date = date_str
+
     try:
-        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-    except ValueError:
-        return _response(400, {"error": "date 형식은 YYYY-MM-DD"}, event)
- 
-    try:
-        limit = max(1, min(int(params.get("limit") or 10), 50))
+        limit = max(1, min(int(params.get("limit") or 100), 200))
     except (ValueError, TypeError):
-        limit = 10
- 
+        limit = 100
+
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(f"""
                     SELECT
                         ce.id,
                         ce.provider,
@@ -497,25 +529,25 @@ def _list_calendar_events(event, user_id):
                     LEFT JOIN summaries s ON s.call_id = ce.call_id
                     WHERE ce.user_id = %s
                       AND ce.status = 'created'
-                      AND DATE(ce.start_at) = %s
+                      AND {where_clause}
                     ORDER BY ce.start_at ASC
                     LIMIT %s
-                """, (user_id, target_date.strftime("%Y-%m-%d"), limit))
+                """, (user_id, *where_args, limit))
                 rows = cur.fetchall() or []
- 
+
         events_out = []
         for row in rows:
             start_at = row.get("start_at")
             end_at   = row.get("end_at")
             time_str = start_at.strftime("%H:%M") if hasattr(start_at, "strftime") else str(start_at or "")[:5]
             end_str  = end_at.strftime("%H:%M")   if hasattr(end_at,   "strftime") else str(end_at   or "")[:5]
- 
+
             desc_parts = []
             if row.get("category"):
                 desc_parts.append(str(row["category"]))
             if row.get("caller_number"):
                 desc_parts.append(str(row["caller_number"]))
- 
+
             events_out.append({
                 "id":          row.get("id"),
                 "provider":    row.get("provider"),
@@ -527,13 +559,13 @@ def _list_calendar_events(event, user_id):
                 "start_at":    str(start_at) if start_at else None,
                 "end_at":      str(end_at)   if end_at   else None,
             })
- 
+
         return _response(200, {
-            "date":   date_str,
+            "date":   resp_date,
             "events": events_out,
             "count":  len(events_out),
         }, event)
- 
+
     except Exception as e:
         logger.exception("[Calendar] list events 실패 user_id=%s", user_id)
         return _response(500, {"error": str(e)}, event)
