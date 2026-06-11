@@ -458,6 +458,86 @@ def _list_connections(event, user_id):
         logger.warning("[Calendar] list connections fallback empty due schema error: %s", e)
         return _response(200, {"connections": [], "warning": "calendar_connections schema fallback"}, event)
 
+def _list_calendar_events(event, user_id):
+    """
+    GET /calendar/events?date=YYYY-MM-DD&limit=10
+ 
+    calendar_events 테이블에서 특정 날짜 일정 반환.
+    date 없으면 오늘(서울 기준).
+    """
+    params = _query(event)
+ 
+    date_str = params.get("date") or datetime.now(SEOUL_TIMEZONE).strftime("%Y-%m-%d")
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        return _response(400, {"error": "date 형식은 YYYY-MM-DD"}, event)
+ 
+    try:
+        limit = max(1, min(int(params.get("limit") or 10), 50))
+    except (ValueError, TypeError):
+        limit = 10
+ 
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        ce.id,
+                        ce.provider,
+                        ce.title,
+                        ce.start_at,
+                        ce.end_at,
+                        ce.event_url,
+                        ce.status,
+                        c.caller_number,
+                        s.category
+                    FROM calendar_events ce
+                    LEFT JOIN calls c ON c.id = ce.call_id
+                    LEFT JOIN summaries s ON s.call_id = ce.call_id
+                    WHERE ce.user_id = %s
+                      AND ce.status = 'created'
+                      AND DATE(ce.start_at) = %s
+                    ORDER BY ce.start_at ASC
+                    LIMIT %s
+                """, (user_id, target_date.strftime("%Y-%m-%d"), limit))
+                rows = cur.fetchall() or []
+ 
+        events_out = []
+        for row in rows:
+            start_at = row.get("start_at")
+            end_at   = row.get("end_at")
+            time_str = start_at.strftime("%H:%M") if hasattr(start_at, "strftime") else str(start_at or "")[:5]
+            end_str  = end_at.strftime("%H:%M")   if hasattr(end_at,   "strftime") else str(end_at   or "")[:5]
+ 
+            desc_parts = []
+            if row.get("category"):
+                desc_parts.append(str(row["category"]))
+            if row.get("caller_number"):
+                desc_parts.append(str(row["caller_number"]))
+ 
+            events_out.append({
+                "id":          row.get("id"),
+                "provider":    row.get("provider"),
+                "title":       row.get("title") or "일정",
+                "time":        time_str,
+                "end_time":    end_str,
+                "description": " · ".join(desc_parts),
+                "event_url":   row.get("event_url"),
+                "start_at":    str(start_at) if start_at else None,
+                "end_at":      str(end_at)   if end_at   else None,
+            })
+ 
+        return _response(200, {
+            "date":   date_str,
+            "events": events_out,
+            "count":  len(events_out),
+        }, event)
+ 
+    except Exception as e:
+        logger.exception("[Calendar] list events 실패 user_id=%s", user_id)
+        return _response(500, {"error": str(e)}, event)
+
 def _handle_authorize(event, user_id, provider):
     params = _query(event)
     redirect_uri = params.get("redirect_uri") or ""
@@ -974,6 +1054,8 @@ def lambda_handler(event, context):
 
     parts = [p for p in path.split("/") if p]
     try:
+        if path == "/calendar/events" and method == "GET":  
+            return _list_calendar_events(event, user_id)
         if path == "/calendar/connections" and method == "GET":
             return _list_connections(event, user_id)
         if len(parts) == 4 and parts[:2] == ["calendar", "connections"] and parts[3] == "authorize" and method == "GET":
