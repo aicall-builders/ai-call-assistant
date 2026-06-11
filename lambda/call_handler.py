@@ -462,6 +462,10 @@ def lambda_handler(event: dict, context) -> dict:
     if path.startswith("/calendar/") or (path.startswith("/calls/") and path.endswith("/calendar-events")):
         import calendar_handler
         return calendar_handler.lambda_handler(routed_event, context)
+    
+    if path.startswith("/calls/") and (path.endswith("/note") or "/photos" in path):
+        import notes_handler
+        return notes_handler.lambda_handler(routed_event, context)
 
     # stores
     if path == "/stores" and method == "GET":
