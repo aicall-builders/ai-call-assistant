@@ -58,7 +58,7 @@ jobs:
       - name: Check if call_handler changed
         id: check_call
         run: |
-          if git diff --name-only HEAD~1 HEAD | grep -qE "lambda/call_handler.py|lambda/keywords.json|lambda/requirements.txt|lambda/redis_client.py"; then
+          if git diff --name-only HEAD~1 HEAD | grep -qE "lambda/call_handler.py|lambda/notes_handler.py|lambda/keywords.json|lambda/requirements.txt|lambda/redis_client.py"; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
@@ -77,7 +77,7 @@ jobs:
         run: |
           cd lambda
           pip install -r requirements.txt -t package/
-          cp call_handler.py auth_handler.py calendar_handler.py keywords.json redis_client.py package/
+          cp call_handler.py auth_handler.py calendar_handler.py notes_handler.py keywords.json redis_client.py package/
           cd package
           zip -r ../call_handler.zip .
           cd ..
