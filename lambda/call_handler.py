@@ -15,7 +15,7 @@ import pymysql.cursors
 import requests
 from botocore.exceptions import ClientError
 
-from redis_client import set_nx_with_ttl, cache_get, cache_set, TTL_UPLOAD_LOCK, check_rate_limit
+from redis_client import set_nx_with_ttl, cache_get, cache_set, cache_delete, TTL_UPLOAD_LOCK, check_rate_limit
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -29,6 +29,13 @@ CLOVA_SPEECH_SECRET_KEY = os.environ.get("CLOVA_SPEECH_SECRET_KEY") or os.enviro
 
 STT_MAX_RETRY_COUNT = int(os.environ.get("STT_MAX_RETRY", 3))
 STT_STALE_MINUTES = int(os.environ.get("STT_STALE_MINUTES", 5))
+
+CUSTOM_KEYWORDS_CACHE_PREFIX = "nlp:custom_keywords:store"
+CUSTOM_KEYWORD_MAX_LENGTH = 50
+CUSTOM_KEYWORD_BLOCKLIST = {
+    "네", "예", "아니요", "아니", "저기", "그럼", "음", "어", "고객", "전화", "통화",
+    "문의", "내용", "확인", "요청", "사장님", "손님", "안녕하세요",
+}
 
 
 def _get_db_password() -> str:
@@ -304,20 +311,29 @@ def _extract_transcript(data: dict) -> str:
 def _invoke_nlp(call_id: str, transcript: str) -> None:
     try:
         caller_number = ""
+        store_id = ""
+        user_id = ""
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT caller_number FROM calls WHERE id = %s", (call_id,))
+                cur.execute(
+                    "SELECT caller_number, store_id, user_id FROM calls WHERE id = %s",
+                    (call_id,),
+                )
                 row = cur.fetchone()
                 if row:
-                    caller_number = row.get("caller_number", "")
+                    caller_number = row.get("caller_number", "") or ""
+                    store_id = row.get("store_id", "") or ""
+                    user_id = row.get("user_id", "") or ""
 
         response = lambda_client.invoke(
             FunctionName="call-recorder-api-nlp",
             InvocationType="RequestResponse",
             Payload=json.dumps({
-                "call_id":      call_id,
-                "transcript":   transcript,
+                "call_id":       call_id,
+                "transcript":    transcript,
                 "caller_number": caller_number,
+                "store_id":      store_id,
+                "user_id":       user_id,
             }).encode(),
         )
         payload = json.loads(response["Payload"].read())
@@ -441,6 +457,8 @@ def _event_with_path(event: dict, path: str, method: str) -> dict:
 def lambda_handler(event: dict, context) -> dict:
     if event.get("action") == "migrate_caller_stats": 
         return _migrate_caller_stats()
+    if event.get("action") == "migrate_custom_keywords":
+        return _migrate_custom_keywords()
         
     path   = _normalize_path(event)
     method = _method(event)
@@ -472,6 +490,22 @@ def lambda_handler(event: dict, context) -> dict:
         return _handle_stores_list(routed_event)
     if path == "/stores" and method == "POST":
         return _handle_stores_create(routed_event)
+
+    if path.startswith("/stores/") and "/keywords" in path:
+        parts = path.strip("/").split("/")
+        if len(parts) == 3 and parts[0] == "stores" and parts[2] == "keywords":
+            store_id = parts[1]
+            if method == "GET":
+                return _handle_custom_keywords_list(routed_event, store_id)
+            if method == "POST":
+                return _handle_custom_keywords_create(routed_event, store_id)
+        if len(parts) == 4 and parts[0] == "stores" and parts[2] == "keywords":
+            store_id = parts[1]
+            keyword_id = parts[3]
+            if method == "PATCH":
+                return _handle_custom_keywords_update(routed_event, store_id, keyword_id)
+            if method == "DELETE":
+                return _handle_custom_keywords_delete(routed_event, store_id, keyword_id)
 
     # calls
     if path == "/calls" and method == "GET":
@@ -805,6 +839,37 @@ def _migrate_caller_stats() -> dict:
     return {
         "statusCode": 200,
         "body": json.dumps({"message": "caller_stats 테이블 생성 완료"})
+    }
+
+
+
+def _migrate_custom_keywords() -> dict:
+    sql = """
+        CREATE TABLE IF NOT EXISTS custom_keywords (
+            id                 VARCHAR(36)  NOT NULL PRIMARY KEY,
+            user_id            VARCHAR(36)  NOT NULL,
+            store_id           VARCHAR(36)  NOT NULL,
+            keyword            VARCHAR(100) NOT NULL,
+            normalized_keyword VARCHAR(100) NOT NULL,
+            label              VARCHAR(100) NULL,
+            action_required    TINYINT(1)   NOT NULL DEFAULT 1,
+            is_enabled         TINYINT(1)   NOT NULL DEFAULT 1,
+            created_at         DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at         DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                       ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_store_keyword (store_id, normalized_keyword),
+            INDEX idx_store_enabled (store_id, is_enabled),
+            INDEX idx_user_store (user_id, store_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        conn.commit()
+    logger.info("[Migrate] custom_keywords 테이블 생성 완료")
+    return {
+        "statusCode": 200,
+        "body": json.dumps({"message": "custom_keywords 테이블 생성 완료"}, ensure_ascii=False),
     }
 
 
