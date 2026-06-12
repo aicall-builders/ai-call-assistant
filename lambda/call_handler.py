@@ -925,3 +925,118 @@ def _response(status: int, body: dict, event: dict = None) -> dict:
         "body": json.dumps(body, ensure_ascii=False, default=str),
     }
 # redeploy notes 2
+
+def _handle_custom_keywords_list(event: dict, store_id: str) -> dict:
+    uid = _get_current_user_id(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"})
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, keyword, label, action_required, is_enabled, created_at
+                       FROM custom_keywords
+                       WHERE store_id = %s AND user_id = %s AND is_enabled = 1
+                       ORDER BY created_at DESC""",
+                    (store_id, uid),
+                )
+                rows = cur.fetchall()
+        result = [{k: str(v) if hasattr(v, "isoformat") else v for k, v in r.items()} for r in rows]
+        return _response(200, {"keywords": result})
+    except Exception as e:
+        logger.exception(f"[Keyword] list 오류: {e}")
+        return _response(500, {"error": "내부 오류"})
+
+
+def _handle_custom_keywords_create(event: dict, store_id: str) -> dict:
+    uid = _get_current_user_id(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"})
+    try:
+        body = json.loads(event.get("body") or "{}")
+        keyword = (body.get("keyword") or "").strip()
+        label = (body.get("label") or keyword).strip()
+        action_required = body.get("action_required", True)
+
+        if not keyword:
+            return _response(400, {"error": "keyword 필수"})
+        if len(keyword) > CUSTOM_KEYWORD_MAX_LENGTH:
+            return _response(400, {"error": f"키워드는 {CUSTOM_KEYWORD_MAX_LENGTH}자 이하"})
+        normalized = "".join(keyword.lower().split())
+        if normalized in CUSTOM_KEYWORD_BLOCKLIST:
+            return _response(400, {"error": "사용할 수 없는 키워드예요"})
+
+        keyword_id = str(uuid.uuid4())
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO custom_keywords
+                       (id, user_id, store_id, keyword, normalized_keyword, label, action_required)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (keyword_id, uid, store_id, keyword, normalized, label, 1 if action_required else 0),
+                )
+            conn.commit()
+
+        # Redis 캐시 무효화
+        cache_key = f"{CUSTOM_KEYWORDS_CACHE_PREFIX}:{store_id}"
+        cache_delete(cache_key)
+
+        return _response(201, {
+            "id": keyword_id,
+            "keyword": keyword,
+            "label": label,
+            "action_required": bool(action_required),
+            "is_enabled": True,
+        })
+    except Exception as e:
+        if "Duplicate entry" in str(e):
+            return _response(409, {"error": "이미 등록된 키워드예요"})
+        logger.exception(f"[Keyword] create 오류: {e}")
+        return _response(500, {"error": "내부 오류"})
+
+
+def _handle_custom_keywords_update(event: dict, store_id: str, keyword_id: str) -> dict:
+    uid = _get_current_user_id(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"})
+    try:
+        body = json.loads(event.get("body") or "{}")
+        is_enabled = body.get("is_enabled", True)
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE custom_keywords SET is_enabled = %s
+                       WHERE id = %s AND store_id = %s AND user_id = %s""",
+                    (1 if is_enabled else 0, keyword_id, store_id, uid),
+                )
+            conn.commit()
+
+        cache_key = f"{CUSTOM_KEYWORDS_CACHE_PREFIX}:{store_id}"
+        cache_delete(cache_key)
+
+        return _response(200, {"message": "업데이트 완료"})
+    except Exception as e:
+        logger.exception(f"[Keyword] update 오류: {e}")
+        return _response(500, {"error": "내부 오류"})
+
+
+def _handle_custom_keywords_delete(event: dict, store_id: str, keyword_id: str) -> dict:
+    uid = _get_current_user_id(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"})
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM custom_keywords WHERE id = %s AND store_id = %s AND user_id = %s",
+                    (keyword_id, store_id, uid),
+                )
+            conn.commit()
+
+        cache_key = f"{CUSTOM_KEYWORDS_CACHE_PREFIX}:{store_id}"
+        cache_delete(cache_key)
+
+        return _response(200, {"message": "삭제 완료"})
+    except Exception as e:
+        logger.exception(f"[Keyword] delete 오류: {e}")
+        return _response(500, {"error": "내부 오류"})
