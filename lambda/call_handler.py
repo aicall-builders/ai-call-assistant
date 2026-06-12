@@ -1,4 +1,4 @@
-# deploy trigger
+# deploy trigger v2
 
 """
 call_handler.py — S3 업로드 + CLOVA STT 요청 + 폴링 메커니즘
