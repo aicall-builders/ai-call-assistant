@@ -352,7 +352,6 @@ def _invoke_nlp(call_id: str, transcript: str) -> None:
     except Exception as e:
         logger.error(f"[NLP] invoke 실패 call_id={call_id}: {e}")
 
-
 def _insert_summary(call_id: str, result: dict) -> None:
     sql = """
         INSERT INTO summaries
@@ -364,24 +363,39 @@ def _insert_summary(call_id: str, result: dict) -> None:
     internal = result.get("internal", {})
     sms      = result.get("sms", {})
 
+    # summary 안전 처리 — 항상 문자열로
+    raw_summary = internal.get("summary") or result.get("summary") or ""
+    if isinstance(raw_summary, dict):
+        summary_str = raw_summary.get("text") or raw_summary.get("label") or raw_summary.get("content") or str(raw_summary)
+    elif isinstance(raw_summary, list):
+        summary_str = " ".join(str(s) for s in raw_summary)
+    else:
+        summary_str = str(raw_summary) if raw_summary else ""
+
+    # extracted_info에서 내부 디버그 필드 제거 (_로 시작하는 키)
+    raw_extracted = result.get("extracted_info", {})
+    if isinstance(raw_extracted, dict):
+        clean_extracted = {k: v for k, v in raw_extracted.items() if not k.startswith("_")}
+    else:
+        clean_extracted = {}
+
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, (
                 str(uuid.uuid4()), call_id,
-                internal.get("summary", result.get("summary", "")),
+                summary_str,
                 result.get("category", "기타"),
                 result.get("domain", "기타"),
                 result.get("sentiment", "neutral"),
                 1 if result.get("action_required") else 0,
                 json.dumps(result.get("keywords", []), ensure_ascii=False),
                 json.dumps(internal.get("keywords", {}), ensure_ascii=False),
-                json.dumps(result.get("extracted_info", {}), ensure_ascii=False),
+                json.dumps(clean_extracted, ensure_ascii=False),
                 1 if sms.get("recommended") else 0,
                 sms.get("message", ""),
             ))
         conn.commit()
     logger.info(f"[Call] summaries INSERT 완료 call_id={call_id} domain={result.get('domain', '기타')}")
-
 
 # ── DB 업데이트 헬퍼 ──────────────────────────────────────────────────────────
 
