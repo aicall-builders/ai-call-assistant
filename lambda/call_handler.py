@@ -1061,19 +1061,31 @@ def _clean_extracted_info() -> dict:
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id, extracted_info FROM summaries WHERE extracted_info IS NOT NULL AND extracted_info != '{}'")
+                cur.execute("SELECT id, extracted_info, internal_keywords FROM summaries WHERE extracted_info IS NOT NULL OR internal_keywords IS NOT NULL")
                 rows = cur.fetchall()
             updated = 0
             for row in rows:
                 try:
-                    info = json.loads(row['extracted_info']) if isinstance(row['extracted_info'], str) else row['extracted_info']
-                    if not isinstance(info, dict):
-                        continue
-                    clean = {k: v for k, v in info.items() if not k.startswith('_')}
-                    if len(clean) != len(info):
+                    ei = row.get('extracted_info')
+                    if isinstance(ei, str):
+                        try: ei = json.loads(ei)
+                        except: ei = {}
+                    clean_ei = {k: v for k, v in (ei or {}).items() if not k.startswith('_')}
+
+                    ik = row.get('internal_keywords')
+                    if isinstance(ik, str):
+                        try: ik = json.loads(ik)
+                        except: ik = {}
+                    clean_ik = {k: v for k, v in (ik or {}).items() if not k.startswith('_')}
+
+                    if len(clean_ei) != len(ei or {}) or len(clean_ik) != len(ik or {}):
                         with conn.cursor() as cur2:
-                            cur2.execute("UPDATE summaries SET extracted_info = %s WHERE id = %s",
-                                       (json.dumps(clean, ensure_ascii=False), row['id']))
+                            cur2.execute(
+                                "UPDATE summaries SET extracted_info = %s, internal_keywords = %s WHERE id = %s",
+                                (json.dumps(clean_ei, ensure_ascii=False),
+                                 json.dumps(clean_ik, ensure_ascii=False),
+                                 row['id'])
+                            )
                         updated += 1
                 except Exception as e:
                     logger.error(f"clean 오류: {e}")
