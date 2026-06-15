@@ -469,6 +469,8 @@ def _event_with_path(event: dict, path: str, method: str) -> dict:
 # ── Lambda 핸들러 ─────────────────────────────────────────────────────────────
 
 def lambda_handler(event: dict, context) -> dict:
+    if event.get("action") == "clean_extracted_info":
+        return _clean_extracted_info()
     if event.get("action") == "migrate_caller_stats": 
         return _migrate_caller_stats()
     if event.get("action") == "migrate_custom_keywords":
@@ -1054,3 +1056,28 @@ def _handle_custom_keywords_delete(event: dict, store_id: str, keyword_id: str) 
     except Exception as e:
         logger.exception(f"[Keyword] delete 오류: {e}")
         return _response(500, {"error": "내부 오류"})
+    
+def _clean_extracted_info() -> dict:
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, extracted_info FROM summaries WHERE extracted_info IS NOT NULL AND extracted_info != '{}'")
+                rows = cur.fetchall()
+            updated = 0
+            for row in rows:
+                try:
+                    info = json.loads(row['extracted_info']) if isinstance(row['extracted_info'], str) else row['extracted_info']
+                    if not isinstance(info, dict):
+                        continue
+                    clean = {k: v for k, v in info.items() if not k.startswith('_')}
+                    if len(clean) != len(info):
+                        with conn.cursor() as cur2:
+                            cur2.execute("UPDATE summaries SET extracted_info = %s WHERE id = %s",
+                                       (json.dumps(clean, ensure_ascii=False), row['id']))
+                        updated += 1
+                except Exception as e:
+                    logger.error(f"clean 오류: {e}")
+            conn.commit()
+        return {"statusCode": 200, "body": json.dumps({"updated": updated, "total": len(rows)})}
+    except Exception as e:
+        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
