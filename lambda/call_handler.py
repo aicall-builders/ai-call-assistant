@@ -780,7 +780,8 @@ def _handle_upload(event: dict) -> dict:
             mime_type = "audio/mp4"
 
         if not store_id:
-            return _response(400, {"error": "store_id 필수"})
+            # store_id 없으면 user_id로 대체
+            store_id = uid
 
         call_id          = str(uuid.uuid4())
         s3_key           = f"recordings/{store_id}/{call_id}/{file_name}"
