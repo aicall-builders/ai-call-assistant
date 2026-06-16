@@ -651,17 +651,7 @@ def _handle_calls_list(event: dict) -> dict:
             with conn.cursor() as cur:
                 cur.execute(sql, values)
                 calls = cur.fetchall()
-        result = []
-        for c in calls:
-            row = {k: str(v) if hasattr(v, "isoformat") else v for k, v in c.items()}
-            for field in ("keywords", "internal_keywords", "extracted_info"):
-                val = row.get(field)
-                if isinstance(val, str):
-                    try:
-                        row[field] = json.loads(val)
-                    except (json.JSONDecodeError, TypeError):
-                        row[field] = {} if field != "keywords" else []
-            result.append(row)
+        result = [{k: str(v) if hasattr(v, "isoformat") else v for k, v in c.items()} for c in calls]
         return _response(200, {"calls": result})
     except Exception as e:
         logger.exception(f"[Call] list 오류: {e}")
@@ -688,13 +678,6 @@ def _handle_call_get(event: dict, call_id: str) -> dict:
         if not call:
             return _response(404, {"error": "통화를 찾을 수 없습니다"})
         result = {k: str(v) if hasattr(v, "isoformat") else v for k, v in call.items()}
-        for field in ("keywords", "internal_keywords", "extracted_info"):
-            val = result.get(field)
-            if isinstance(val, str):
-                try:
-                    result[field] = json.loads(val)
-                except (json.JSONDecodeError, TypeError):
-                    result[field] = {} if field != "keywords" else []
         return _response(200, {"call": result})
     except Exception as e:
         logger.exception(f"[Call] get 오류: {e}")
