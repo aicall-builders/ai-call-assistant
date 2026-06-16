@@ -405,21 +405,30 @@ def _exchange_code(provider, code, redirect_uri, state=None):
     return res.json()
 
 
-def _fetch_profile(provider, access_token):
+def _fetch_profile(provider, access_token, id_token=None):  # ← id_token 파라미터 추가
     if provider == "google":
+        if id_token:  # ← id_token 있으면 tokeninfo로 파싱
+            res = requests.get(
+                "https://oauth2.googleapis.com/tokeninfo",
+                params={"id_token": id_token},   # ← access_token → id_token으로 교체
+                timeout=10,
+            )
+            if res.status_code < 400:
+                data = res.json()
+                return {
+                    "provider": "google",
+                    "provider_user_id": str(data.get("sub") or ""),
+                    "email": data.get("email") or "",
+                    "nickname": data.get("name") or data.get("email") or "Google 사용자",
+                }
+        # id_token 없거나 실패 시 → access_token으로 userinfo 직접 조회 (fallback)
         res = requests.get(
-            "https://oauth2.googleapis.com/tokeninfo",
-            params={"id_token": access_token},
+            "https://openidconnect.googleapis.com/v1/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
             timeout=10,
         )
         if res.status_code >= 400:
-            res = requests.get(
-                "https://openidconnect.googleapis.com/v1/userinfo",
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=10,
-            )
-            if res.status_code >= 400:
-                raise RuntimeError(f"Google 사용자 정보 조회 실패: HTTP {res.status_code} {res.text[:300]}")
+            raise RuntimeError(f"Google 사용자 정보 조회 실패: HTTP {res.status_code} {res.text[:300]}")
         data = res.json()
         return {
             "provider": "google",
@@ -427,6 +436,7 @@ def _fetch_profile(provider, access_token):
             "email": data.get("email") or "",
             "nickname": data.get("name") or data.get("email") or "Google 사용자",
         }
+        
     if provider == "naver":
         res = requests.get(
             "https://openapi.naver.com/v1/nid/me",
@@ -563,6 +573,8 @@ def _handle_provider_login(event, provider):
 
     try:
         access_token = body.get("provider_access_token") or body.get("access_token") or body.get(f"{provider}_access_token")
+        id_token = None  # ← 여기 추가! 반드시 먼저 초기화
+        
         if not access_token:
             code = body.get("authorization_code") or body.get("code")
             redirect_uri = body.get("redirect_uri") or ""
@@ -571,10 +583,12 @@ def _handle_provider_login(event, provider):
                 return _response(400, {"error": "provider_access_token 또는 authorization_code가 필요합니다"}, event)
             token_data = _exchange_code(provider, code, redirect_uri, state)
             access_token = token_data.get("access_token")
-        if not access_token:
-            return _response(400, {"error": "provider access token 발급 실패"}, event)
-
-        profile = _fetch_profile(provider, access_token)
+            id_token = token_data.get("id_token") if provider == "google" else None  # ← 기존 유지
+            
+            if not access_token:
+                return _response(400, {"error": "provider access token 발급 실패"}, event)
+            
+            profile = _fetch_profile(provider, access_token, id_token=id_token)
         try:
             logger.info("[Auth] DB user upsert start provider=%s provider_user_id=%s", provider, profile.get("provider_user_id"))
             user = _upsert_user(profile)
