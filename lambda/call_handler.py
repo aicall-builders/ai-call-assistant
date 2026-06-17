@@ -544,6 +544,10 @@ def lambda_handler(event: dict, context) -> dict:
     if path == "/calls/upload" and method == "POST":
         return _handle_upload(routed_event)
 
+    # ── 임시 마이그레이션 (실행 후 제거 권장) ──
+    if path == "/migrate/caller-name" and method == "POST":
+        return _handle_migrate_caller_name(routed_event)
+
     return _response(404, {"error": "Not found", "path": path}, event)
 
 
@@ -690,20 +694,60 @@ def _handle_call_patch(event: dict, call_id: str) -> dict:
         return _response(401, {"error": "인증 필요"})
     try:
         body = json.loads(event.get("body") or "{}")
-        caller_category = body.get("caller_category", "").strip()
-        if caller_category not in ("BUSINESS", "PERSONAL", "UNCLASSIFIED"):
-            return _response(400, {"error": "유효하지 않은 category"})
+        fields: list[str] = []
+        params: list = []
+
+        # 부분 업데이트: 들어온 필드만 수정
+        if "caller_category" in body:
+            caller_category = (body.get("caller_category") or "").strip()
+            if caller_category not in ("BUSINESS", "PERSONAL", "UNCLASSIFIED"):
+                return _response(400, {"error": "유효하지 않은 category"})
+            fields.append("caller_category = %s")
+            params.append(caller_category)
+        if "caller_number" in body:
+            fields.append("caller_number = %s")
+            params.append((body.get("caller_number") or "").strip())
+        if "caller_name" in body:
+            fields.append("caller_name = %s")
+            params.append((body.get("caller_name") or "").strip())
+
+        if not fields:
+            return _response(400, {"error": "수정할 항목이 없습니다"})
+
+        params.extend([call_id, uid])
+        sql = f"UPDATE calls SET {', '.join(fields)} WHERE id = %s AND user_id = %s"
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE calls SET caller_category = %s WHERE id = %s AND user_id = %s",
-                    (caller_category, call_id, uid)
-                )
+                cur.execute(sql, tuple(params))
             conn.commit()
         return _response(200, {"message": "업데이트 완료"})
     except Exception as e:
         logger.exception(f"[Call] patch 오류: {e}")
         return _response(500, {"error": "내부 오류"})
+
+def _handle_migrate_caller_name(event: dict) -> dict:
+    """임시 마이그레이션: calls.caller_name 컬럼 추가 (멱등 - 이미 있으면 건너뜀). 실행 후 라우트 제거 권장."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COUNT(*) AS cnt
+                    FROM information_schema.columns
+                    WHERE table_schema = DATABASE()
+                      AND table_name = 'calls'
+                      AND column_name = 'caller_name'
+                """)
+                already = int((cur.fetchone() or {}).get("cnt", 0))
+                if not already:
+                    cur.execute("ALTER TABLE calls ADD COLUMN caller_name VARCHAR(100) NULL")
+            conn.commit()
+        return _response(200, {
+            "message": "caller_name 마이그레이션 완료",
+            "already_existed": bool(already),
+        })
+    except Exception as e:
+        logger.exception(f"[Migrate] caller_name 오류: {e}")
+        return _response(500, {"error": str(e)})
 
 
 def _handle_call_delete(event: dict, call_id: str) -> dict:
