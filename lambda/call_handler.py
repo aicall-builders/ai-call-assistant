@@ -552,12 +552,11 @@ def lambda_handler(event: dict, context) -> dict:
     if path == "/calls/upload" and method == "POST":
         return _handle_upload(routed_event)
 
-    # ── 임시 마이그레이션 (실행 후 제거 권장) ──
-    if path == "/migrate/caller-name" and method == "POST":
-        return _handle_migrate_caller_name(routed_event)
-    
-    if path == "/migrate/user-domain" and method == "POST":
-        return _handle_migrate_user_domain(routed_event)
+    # ── 임시 마이그레이션 라우트 제거됨 (보안) ──
+    # /migrate/caller-name, /migrate/user-domain 공개 라우트는 인증 없이
+    # ALTER TABLE을 실행할 수 있어 제거함. 스키마 변경이 다시 필요하면
+    # 콘솔에서 Lambda를 직접 invoke(payload {"action": ...})하거나 마이그레이션
+    # 도구를 통해 수행할 것.
 
     return _response(404, {"error": "Not found", "path": path}, event)
 
@@ -583,6 +582,27 @@ def _get_current_user_id(event: dict) -> str | None:
     except Exception as e:
         logger.error(f"[Call] _get_current_user_id 오류: {e}")
         return None
+
+
+def _assert_owns_store(uid: str, store_id: str) -> bool:
+    """
+    store_id가 uid 소유(stores.owner_id)인지 확인.
+    BOLA(객체 단위 권한 우회) 방지를 위해, store_id를 외부에서 받는
+    모든 경로에서 INSERT/조회 전에 반드시 호출한다.
+    """
+    if not uid or not store_id:
+        return False
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM stores WHERE id = %s AND owner_id = %s LIMIT 1",
+                    (store_id, uid),
+                )
+                return cur.fetchone() is not None
+    except Exception as e:
+        logger.error(f"[Auth] store 소유권 확인 오류 store={store_id} uid={uid}: {e}")
+        return False
 
 
 def _handle_stores_list(event: dict) -> dict:
@@ -736,30 +756,6 @@ def _handle_call_patch(event: dict, call_id: str) -> dict:
         logger.exception(f"[Call] patch 오류: {e}")
         return _response(500, {"error": "내부 오류"})
 
-def _handle_migrate_caller_name(event: dict) -> dict:
-    """임시 마이그레이션: calls.caller_name 컬럼 추가 (멱등 - 이미 있으면 건너뜀). 실행 후 라우트 제거 권장."""
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT COUNT(*) AS cnt
-                    FROM information_schema.columns
-                    WHERE table_schema = DATABASE()
-                      AND table_name = 'calls'
-                      AND column_name = 'caller_name'
-                """)
-                already = int((cur.fetchone() or {}).get("cnt", 0))
-                if not already:
-                    cur.execute("ALTER TABLE calls ADD COLUMN caller_name VARCHAR(100) NULL")
-            conn.commit()
-        return _response(200, {
-            "message": "caller_name 마이그레이션 완료",
-            "already_existed": bool(already),
-        })
-    except Exception as e:
-        logger.exception(f"[Migrate] caller_name 오류: {e}")
-        return _response(500, {"error": str(e)})
-
 # ── 유저 도메인(업종) ─────────────────────────────────────────
 VALID_DOMAINS = {"real_estate", "education", "insurance", "construction", "retail"}
 
@@ -801,7 +797,11 @@ def _handle_me_patch(event: dict) -> dict:
 
 
 def _handle_migrate_user_domain(event: dict) -> dict:
-    """users.domain 컬럼 추가 (멱등). 1회 호출 후 라우트 제거 권장."""
+    """
+    users.domain 컬럼 추가 (멱등). 관리자 전용.
+    API Gateway 공개 라우트는 제거했으며, 콘솔에서 Lambda를 직접
+    invoke(payload {"action": "migrate_user_domain"})할 때만 호출된다.
+    """
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -894,8 +894,13 @@ def _handle_upload(event: dict) -> dict:
         if file_name.lower().endswith((".m4a", ".mp4")) or mime_type in ("audio/m4a", "audio/x-m4a"):
             mime_type = "audio/mp4"
 
-        if not store_id:
-            # store_id 없으면 user_id로 대체
+        if store_id:
+            # store_id가 명시되면 반드시 소유권 검증 (BOLA 방지)
+            if not _assert_owns_store(uid, store_id):
+                logger.warning(f"[Call] upload 권한 위반 시도 uid={uid} store={store_id}")
+                return _response(403, {"error": "권한이 없는 매장입니다"}, event)
+        else:
+            # store_id 없으면 user_id로 대체 (개인 기본 버킷)
             store_id = uid
 
         call_id          = str(uuid.uuid4())
@@ -1062,6 +1067,8 @@ def _handle_custom_keywords_list(event: dict, store_id: str) -> dict:
     uid = _get_current_user_id(event)
     if not uid:
         return _response(401, {"error": "인증 필요"})
+    if not _assert_owns_store(uid, store_id):
+        return _response(403, {"error": "권한이 없는 매장입니다"})
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -1084,6 +1091,10 @@ def _handle_custom_keywords_create(event: dict, store_id: str) -> dict:
     uid = _get_current_user_id(event)
     if not uid:
         return _response(401, {"error": "인증 필요"})
+    if not _assert_owns_store(uid, store_id):
+        # store 소유권 미검증 시 타 매장 NLP 파이프라인에 키워드 주입 가능 (cross-tenant)
+        logger.warning(f"[Keyword] create 권한 위반 시도 uid={uid} store={store_id}")
+        return _response(403, {"error": "권한이 없는 매장입니다"})
     try:
         body = json.loads(event.get("body") or "{}")
         keyword = (body.get("keyword") or "").strip()
@@ -1131,6 +1142,8 @@ def _handle_custom_keywords_update(event: dict, store_id: str, keyword_id: str) 
     uid = _get_current_user_id(event)
     if not uid:
         return _response(401, {"error": "인증 필요"})
+    if not _assert_owns_store(uid, store_id):
+        return _response(403, {"error": "권한이 없는 매장입니다"})
     try:
         body = json.loads(event.get("body") or "{}")
         is_enabled = body.get("is_enabled", True)
@@ -1156,6 +1169,8 @@ def _handle_custom_keywords_delete(event: dict, store_id: str, keyword_id: str) 
     uid = _get_current_user_id(event)
     if not uid:
         return _response(401, {"error": "인증 필요"})
+    if not _assert_owns_store(uid, store_id):
+        return _response(403, {"error": "권한이 없는 매장입니다"})
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
