@@ -1,0 +1,109 @@
+2026-05-04 | Initial commit: AI call assistant backend
+2026-05-08 | feat: Lambda 백엔드를 별도 lambda/ 폴더로 정리
+2026-05-08 | Merge pull request #1 from seongminj0613-tech/feature/lambda-restructure
+2026-05-08 | Update README.md
+2026-05-11 | feat: STT 정규화 (1차 LLM) + 1시간 통화 검증
+2026-05-11 | Merge pull request #2 from seongminj0613-tech/feature/lambda-restructure
+2026-05-14 | Revise README for project name and backend details
+2026-05-20 | feat: 모놀리식 → Lambda 핸들러 분리 (auth/call/nlp)
+2026-05-20 | Merge pull request #3 from seongminj0613-tech/feature/lambda-restructure
+2026-05-20 | Revise architecture and API documentationah
+2026-05-20 | Update README.md
+2026-05-20 | feat: GitHub Actions Lambda 자동 배포 workflow 추가
+2026-05-20 | Merge branch 'feature/lambda-restructure'
+2026-05-20 | fix: workflow 파일 위치 수정 (루트 .github/workflows로 이동)
+2026-05-20 | test: GitHub Actions 자동 배포 테스트
+2026-05-20 | fix: workflow 조건 수정 - git diff 기반으로 변경
+2026-05-20 | feat: Redis 캐싱 추가 (keywords 핫리로드, 토큰 캐싱, 중복업로드 방지)
+2026-05-20 | fix: Firebase BASE64 환경변수 파싱 수정
+2026-05-20 | fix: UTF-8 BOM 제거
+2026-05-20 | fix: auth_handler 인코딩 강제 재배포
+2026-05-20 | fix: auth_handler 전체 재작성 (인코딩 문제 해결)
+2026-05-20 | feat: CLOVA STT 요청 + 폴링 메커니즘 추가
+2026-05-20 | refactor: Whisper fallback 제거, CLOVA 실패 시 error 처리
+2026-05-20 | feat: CLOVA 완료 시 NLP Lambda 비동기 invoke 추가
+2026-05-20 | feat: GPT mini 분석 + summaries INSERT 추가
+2026-05-20 | feat: openai 패키지 추가
+2026-05-20 | fix: Lambda 배포 시 외부 패키지 포함하도록 수정
+2026-05-20 | fix: nlp_handler 패키지 포함 재배포
+2026-05-20 | fix: nlp_handler 항상 배포하도록 수정
+2026-05-20 | fix: nlp_handler 강제 재배포
+2026-05-20 | fix: paths 조건 제거, main push시 항상 배포
+2026-05-20 | fix: OpenAI 클라이언트 타임아웃 55초로 설정
+2026-05-20 | refactor: nlp_handler DB 제거, GPT 결과만 반환
+2026-05-20 | feat: NLP 동기 호출 + summaries INSERT 추가
+2026-05-20 | feat: CloudWatch 메트릭 추가 (폴링 횟수, 복구/실패 건수)
+2026-05-21 | fix: /auth/kakao 핸들러 추가 및 CORS 헤더 적용
+2026-05-21 | fix: 카카오 API 호출 프론트로 이동
+2026-05-21 | fix: force deploy auth_handler
+2026-05-21 | feat: stores/calls CRUD 라우트 추가
+2026-05-21 | fix: force deploy call_handler
+2026-05-21 | fix: presigned URL 방식으로 업로드 수정
+2026-05-21 | fix: 기존 DB 스키마에 맞게 uid 조회 수정
+2026-05-21 | fix: calls 목록에 summaries JOIN 추가
+2026-05-21 | chore: deploy workflow 원래대로 복구
+2026-05-21 | Update README.md
+2026-05-21 | fix: DB 비밀번호 Secrets Manager에서 동적으로 조회
+2026-05-21 | fix: auth_handler DB 비밀번호 Secrets Manager에서 동적으로 조회
+2026-05-27 | fix: CORS allowed origins에 localhost:3000 추가
+2026-05-27 | fix: call_handler CORS allowed origins에 localhost:3000 추가
+2026-05-27 | feat(backend): add persistent calendar oauth integration
+2026-05-28 | fix: JWT 서명 검증 추가 (Firebase verify_id_token)
+2026-05-28 | revert: JWT 검증 롤백
+2026-05-28 | feat: Rate Limiting 추가 (Redis INCR)
+2026-05-28 | feat: GPT 응답 가드레일 추가 (category/sentiment 유효성 검증)
+2026-05-28 | fix(backend): correct Naver calendar event creation request
+2026-05-29 | feat: Grafana 익명 접속 설정 추가
+2026-05-29 | feat: Grafana 익명 접속 설정 추가
+2026-05-29 | Update README.md
+2026-05-29 | feat: 도메인 자동 파악 + 업종별 맞춤 키워드 + SMS 생성
+2026-05-29 | Merge branch 'main' of https://github.com/seongminj0613-tech/ai-call-assistant
+2026-05-29 | feat: summaries 테이블 신규 컬럼 반영 (domain, sms)
+2026-05-29 | feat: calls 조회 API에 domain, sms 컬럼 추가
+2026-05-29 | feat: 솔라피 SMS 자동 발송 기능 추가
+2026-05-29 | feat: SMS 선택 발송으로 변경 + /calls/{id}/sms 엔드포인트 추가
+2026-05-29 | fix: 솔라피 HMAC salt UUID로 수정
+2026-05-29 | fix: sms_handler.py 배포 포함
+2026-05-29 | fix: sms_handler.py 배포 포함 + check_call 조건 수정
+2026-05-29 | fix: CLOVA STT 400 응답 본문 로깅 추가
+2026-05-29 | fix: CLOVA STT를 sync 방식으로 변경 (콜백/OBS 불필요)
+2026-05-29 | feat: 통화 상세 조회에 summaries 조인 추가
+2026-05-29 | feat: 발신번호 추출/저장 + 요약 완료 상태
+2026-05-29 | fix: 대시보드 시간 UTC→KST (timezone-aware ISO 직렬화)
+2026-06-03 | 1차 통합
+2026-06-04 | 구글, 네이버, 카카오 캘린더 연동 완료
+2026-06-04 | Revert "fix: 대시보드 시간 UTC→KST (timezone-aware ISO 직렬화)"
+2026-06-04 | merge: feature/calendar-oauth-integration
+2026-06-04 | ci: add calendar_handler deploy, remove sms_handler refs
+2026-06-04 | fix: add auth_handler to call_handler deploy package
+2026-06-04 | fix: force redeploy call_handler with auth_handler
+2026-06-04 | feat: add domain and internal_keywords to calls list API
+2026-06-04 | feat: enable CLOVA speaker diarization
+2026-06-04 | fix: extract speaker labels from CLOVA diarization response
+2026-06-08 | feat: caller_stats 테이블 생성 및 통화 누적 기능 추가
+2026-06-08 | feat: counterpart_number를 caller_number로 바로 저장
+2026-06-09 | fix: 구글 로그인 idToken 검증 방식으로 수정
+2026-06-09 | fix: path 정규화 로그 추가
+2026-06-09 | fix: 캘린더 연동 401 - DB 미등록 유저 처리
+2026-06-11 | feat: GET /calendar/events 엔드포인트 추가
+2026-06-11 | feat: 캘린더 일정 월 범위 조회 from~to 지원
+2026-06-11 | feat: 통화 메모/사진 관리 notes_handler 추가
+2026-06-11 | fix: notes_handler 배포 추가
+2026-06-11 | redeploy: notes_handler 강제 배포
+2026-06-11 | feat(api): add custom filtering keyword CRUD
+2026-06-11 | feat(nlp): apply custom keywords to important call detection
+2026-06-11 | chore(lambda): sync custom keyword deployment stage
+2026-06-12 | feat: merge custom-filter-keywords branch
+2026-06-12 | feat: add custom keywords CRUD handlers
+2026-06-12 | fix: force redeploy call_handler
+2026-06-12 | fix: trigger call_handler redeploy
+2026-06-15 | fix: summary 문자열 변환 + extracted_info 내부 필드 제거
+2026-06-15 | feat: extracted_info 내부 필드 정리 액션 추가
+2026-06-15 | fix: internal_keywords도 _ 필드 정리
+2026-06-16 | fix: keywords/extracted_info JSON 파싱 후 응답
+2026-06-16 | force redeploy
+2026-06-16 | revert: keywords JSON 파싱 롤백 (앱 호환성)
+2026-06-16 | fix: store_id 없어도 파일 업로드 가능하도록 수정
+2026-06-16 | fix: Google OAuth id_token 분리로 Invalid Credentials 에러 수정
+2026-06-16 | fix: _handle_provider_login profile 변수 스코프 버그 수정
+2026-06-17 | feat: caller_name PATCH 확장 + 임시 마이그레이션 엔드포인트

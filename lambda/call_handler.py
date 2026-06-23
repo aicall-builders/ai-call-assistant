@@ -522,6 +522,12 @@ def lambda_handler(event: dict, context) -> dict:
                 return _handle_custom_keywords_update(routed_event, store_id, keyword_id)
             if method == "DELETE":
                 return _handle_custom_keywords_delete(routed_event, store_id, keyword_id)
+            
+    # me (유저 본인 / 도메인)
+    if path == "/me" and method == "GET":
+        return _handle_me_get(routed_event)
+    if path == "/me" and method == "PATCH":
+        return _handle_me_patch(routed_event)
 
     # calls
     if path == "/calls" and method == "GET":
@@ -547,6 +553,9 @@ def lambda_handler(event: dict, context) -> dict:
     # ── 임시 마이그레이션 (실행 후 제거 권장) ──
     if path == "/migrate/caller-name" and method == "POST":
         return _handle_migrate_caller_name(routed_event)
+    
+    if path == "/migrate/user-domain" and method == "POST":
+        return _handle_migrate_user_domain(routed_event)
 
     return _response(404, {"error": "Not found", "path": path}, event)
 
@@ -748,6 +757,66 @@ def _handle_migrate_caller_name(event: dict) -> dict:
     except Exception as e:
         logger.exception(f"[Migrate] caller_name 오류: {e}")
         return _response(500, {"error": str(e)})
+
+# ── 유저 도메인(업종) ─────────────────────────────────────────
+VALID_DOMAINS = {"real_estate", "education", "insurance", "construction", "retail"}
+
+def _handle_me_get(event: dict) -> dict:
+    uid = _get_current_user_id(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"}, event)
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, name, email, role, domain FROM users WHERE id = %s", (uid,))
+                user = cur.fetchone()
+        if not user:
+            return _response(404, {"error": "유저를 찾을 수 없습니다"}, event)
+        result = {k: str(v) if hasattr(v, "isoformat") else v for k, v in user.items()}
+        return _response(200, {"user": result}, event)
+    except Exception as e:
+        logger.exception(f"[Me] get 오류: {e}")
+        return _response(500, {"error": "내부 오류"}, event)
+
+
+def _handle_me_patch(event: dict) -> dict:
+    uid = _get_current_user_id(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"}, event)
+    try:
+        body = json.loads(event.get("body") or "{}")
+        domain = (body.get("domain") or "").strip()
+        if domain not in VALID_DOMAINS:
+            return _response(400, {"error": "유효하지 않은 domain"}, event)
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET domain = %s WHERE id = %s", (domain, uid))
+            conn.commit()
+        return _response(200, {"message": "업데이트 완료", "domain": domain}, event)
+    except Exception as e:
+        logger.exception(f"[Me] patch 오류: {e}")
+        return _response(500, {"error": "내부 오류"}, event)
+
+
+def _handle_migrate_user_domain(event: dict) -> dict:
+    """users.domain 컬럼 추가 (멱등). 1회 호출 후 라우트 제거 권장."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COUNT(*) AS cnt FROM information_schema.columns
+                    WHERE table_schema = DATABASE()
+                      AND table_name = 'users' AND column_name = 'domain'
+                """)
+                already = int((cur.fetchone() or {}).get("cnt", 0))
+                if not already:
+                    cur.execute("ALTER TABLE users ADD COLUMN domain VARCHAR(40) NULL")
+            conn.commit()
+        return _response(200, {"message": "domain 컬럼 마이그레이션 완료", "already_existed": bool(already)}, event)
+    except Exception as e:
+        logger.exception(f"[Migrate] user domain 오류: {e}")
+        return _response(500, {"error": str(e)}, event)
+
 
 
 def _handle_call_delete(event: dict, call_id: str) -> dict:
@@ -1102,6 +1171,8 @@ def _handle_custom_keywords_delete(event: dict, store_id: str, keyword_id: str) 
         logger.exception(f"[Keyword] delete 오류: {e}")
         return _response(500, {"error": "내부 오류"})
     
+    
+
 def _clean_extracted_info() -> dict:
     try:
         with get_db() as conn:
