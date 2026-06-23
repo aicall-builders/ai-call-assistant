@@ -1362,13 +1362,15 @@ def _diag_summaries() -> dict:
             total_calls = (cur.fetchone() or {}).get("cnt", 0)
             cur.execute("SELECT COUNT(*) AS cnt FROM customer_analysis WHERE analysis IS NOT NULL AND analysis <> ''")
             real_analysis = (cur.fetchone() or {}).get("cnt", 0)
+            cur.execute("SELECT phone FROM customer_analysis WHERE analysis <> '' LIMIT 5")
+            sample_phones = [r["phone"] for r in cur.fetchall()]
     return {"statusCode": 200, "body": json.dumps({
         "total_calls": total_calls,
         "calls_with_summary": with_summary,
         "status_distribution": status_dist,
         "customers_with_real_analysis": real_analysis,
+        "sample_phones": sample_phones,
     }, ensure_ascii=False, default=str)}
-
 
 def _response(status: int, body: dict, event: dict = None) -> dict:
     return {
