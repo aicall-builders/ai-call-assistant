@@ -477,11 +477,20 @@ def lambda_handler(event: dict, context) -> dict:
         return _migrate_custom_keywords()
     if event.get("action") == "migrate_user_domain":
         return _handle_migrate_user_domain(event)
-        
+    if event.get("action") == "migrate_customer_profiles":
+        return _migrate_customer_profiles()
+    if event.get("action") == "generate_customer_analysis":
+        return _run_customer_analysis_batch()
+
     path   = _normalize_path(event)
     method = _method(event)
 
     if event.get("source") == "aws.events":
+        # EventBridge 규칙별 분기: detail.job == "customer_analysis" 면 분석 배치,
+        # 아니면 기존 STT 폴링.
+        detail = event.get("detail") or {}
+        if detail.get("job") == "customer_analysis":
+            return _run_customer_analysis_batch()
         return check_pending_stt(event, context)
 
     if method == "OPTIONS":
@@ -551,6 +560,18 @@ def lambda_handler(event: dict, context) -> dict:
         return _handle_call_delete(routed_event, call_id)
     if path == "/calls/upload" and method == "POST":
         return _handle_upload(routed_event)
+
+    # customers (고객 프로필 + AI 분석)
+    #   GET  /customers/{phone}  → 프로필 + 분석 조회
+    #   PATCH /customers/{phone} → 편집 필드 저장
+    #   phone은 URL 인코딩되어 들어옴. 소유 통화에 있는 번호만 허용(BOLA 방지).
+    if path.startswith("/customers/"):
+        import urllib.parse
+        phone = urllib.parse.unquote(path.split("/", 2)[2])
+        if method == "GET":
+            return _handle_customer_get(routed_event, phone)
+        if method == "PATCH":
+            return _handle_customer_patch(routed_event, phone)
 
     # ── 임시 마이그레이션 라우트 제거됨 (보안) ──
     # /migrate/caller-name, /migrate/user-domain 공개 라우트는 인증 없이
@@ -1056,6 +1077,257 @@ def _upsert_caller_stats(call_id: str) -> None:
 
     except Exception as e:
         logger.error(f"[Stats] caller_stats 업데이트 실패: {e}")
+
+
+# ════════════════════════════════════════════════════════════
+# 고객 프로필 + AI 분석
+# ════════════════════════════════════════════════════════════
+
+CUSTOMER_PROFILE_FIELDS = ("email", "tendency", "medical", "special_notes")
+
+
+def _migrate_customer_profiles() -> dict:
+    """
+    customer_profiles (편집 필드) + customer_analysis (AI 분석문) 테이블 생성. 멱등.
+    고객 식별키 = (user_id, phone).
+    """
+    sql_profiles = """
+        CREATE TABLE IF NOT EXISTS customer_profiles (
+            id            VARCHAR(36)  NOT NULL PRIMARY KEY,
+            user_id       VARCHAR(36)  NOT NULL,
+            phone         VARCHAR(20)  NOT NULL,
+            email         VARCHAR(200) NULL,
+            tendency      VARCHAR(500) NULL,
+            medical       VARCHAR(500) NULL,
+            special_notes VARCHAR(1000) NULL,
+            custom_fields JSON         NULL,
+            created_at    DATETIME     NOT NULL DEFAULT NOW(),
+            updated_at    DATETIME     NOT NULL DEFAULT NOW() ON UPDATE NOW(),
+            UNIQUE KEY uq_user_phone (user_id, phone),
+            INDEX idx_user (user_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """
+    sql_analysis = """
+        CREATE TABLE IF NOT EXISTS customer_analysis (
+            id          VARCHAR(36) NOT NULL PRIMARY KEY,
+            user_id     VARCHAR(36) NOT NULL,
+            phone       VARCHAR(20) NOT NULL,
+            analysis    TEXT        NULL,
+            call_count  INT         NOT NULL DEFAULT 0,
+            generated_at DATETIME   NOT NULL DEFAULT NOW(),
+            UNIQUE KEY uq_user_phone_an (user_id, phone),
+            INDEX idx_user_an (user_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql_profiles)
+            cur.execute(sql_analysis)
+        conn.commit()
+    logger.info("[Migrate] customer_profiles + customer_analysis 생성 완료")
+    return {"statusCode": 200, "body": json.dumps({"message": "customer 테이블 생성 완료"}, ensure_ascii=False)}
+
+
+def _user_owns_phone(uid: str, phone: str) -> bool:
+    """해당 phone이 user의 통화(calls)에 존재하는지 확인 (BOLA 방지)."""
+    if not uid or not phone:
+        return False
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM calls WHERE user_id = %s AND caller_number = %s LIMIT 1",
+                    (uid, phone),
+                )
+                return cur.fetchone() is not None
+    except Exception as e:
+        logger.error(f"[Customer] phone 소유 확인 오류 uid={uid}: {e}")
+        return False
+
+
+def _handle_customer_get(event: dict, phone: str) -> dict:
+    uid = _get_current_user_id(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"}, event)
+    if not _user_owns_phone(uid, phone):
+        return _response(404, {"error": "고객을 찾을 수 없습니다"}, event)
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT email, tendency, medical, special_notes, custom_fields, updated_at
+                       FROM customer_profiles WHERE user_id = %s AND phone = %s""",
+                    (uid, phone),
+                )
+                profile = cur.fetchone()
+                cur.execute(
+                    """SELECT analysis, call_count, generated_at
+                       FROM customer_analysis WHERE user_id = %s AND phone = %s""",
+                    (uid, phone),
+                )
+                analysis = cur.fetchone()
+
+        prof = {k: (str(v) if hasattr(v, "isoformat") else v) for k, v in (profile or {}).items()}
+        anal = {k: (str(v) if hasattr(v, "isoformat") else v) for k, v in (analysis or {}).items()}
+        return _response(200, {"profile": prof, "analysis": anal}, event)
+    except Exception as e:
+        logger.exception(f"[Customer] get 오류: {e}")
+        return _response(500, {"error": "내부 오류"}, event)
+
+
+def _handle_customer_patch(event: dict, phone: str) -> dict:
+    uid = _get_current_user_id(event)
+    if not uid:
+        return _response(401, {"error": "인증 필요"}, event)
+    if not _user_owns_phone(uid, phone):
+        return _response(404, {"error": "고객을 찾을 수 없습니다"}, event)
+    try:
+        body = json.loads(event.get("body") or "{}")
+
+        email = (body.get("email") or "").strip()
+        tendency = (body.get("tendency") or "").strip()
+        medical = (body.get("medical") or "").strip()
+        special_notes = (body.get("special_notes") or "").strip()
+        custom_fields = body.get("custom_fields")
+        custom_json = json.dumps(custom_fields, ensure_ascii=False) if custom_fields is not None else None
+
+        # UPSERT (user_id+phone 유니크)
+        sql = """
+            INSERT INTO customer_profiles
+                (id, user_id, phone, email, tendency, medical, special_notes, custom_fields)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                email = VALUES(email),
+                tendency = VALUES(tendency),
+                medical = VALUES(medical),
+                special_notes = VALUES(special_notes),
+                custom_fields = VALUES(custom_fields),
+                updated_at = NOW()
+        """
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (
+                    str(uuid.uuid4()), uid, phone,
+                    email or None, tendency or None, medical or None,
+                    special_notes or None, custom_json,
+                ))
+            conn.commit()
+        return _response(200, {"message": "저장 완료"}, event)
+    except Exception as e:
+        logger.exception(f"[Customer] patch 오류: {e}")
+        return _response(500, {"error": "내부 오류"}, event)
+
+
+def _run_customer_analysis_batch() -> dict:
+    """
+    EventBridge(하루 2회) 진입점. 통화가 있는 (user_id, phone)별로
+    통화 요약들을 모아 nlp Lambda의 고객 분석을 호출 → customer_analysis 저장.
+    GPT 비용 절약을 위해 마지막 분석 이후 통화 수가 변한 고객만 갱신.
+    """
+    logger.info("[CustomerAI] 배치 시작")
+    result = {"targets": 0, "updated": 0, "skipped": 0, "failed": 0}
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                # 고객별 통화 수 + 최신 분석 시점의 call_count 비교
+                cur.execute("""
+                    SELECT c.user_id, c.caller_number AS phone,
+                           COUNT(*) AS call_count,
+                           COALESCE(a.call_count, -1) AS analyzed_count
+                    FROM calls c
+                    LEFT JOIN customer_analysis a
+                           ON a.user_id = c.user_id AND a.phone = c.caller_number
+                    WHERE c.caller_number IS NOT NULL AND c.caller_number <> ''
+                    GROUP BY c.user_id, c.caller_number, a.call_count
+                """)
+                rows = cur.fetchall()
+
+        result["targets"] = len(rows)
+        for row in rows:
+            uid = row["user_id"]
+            phone = row["phone"]
+            call_count = int(row["call_count"])
+            analyzed = int(row["analyzed_count"])
+
+            # 통화 수 변동 없으면 스킵
+            if call_count == analyzed:
+                result["skipped"] += 1
+                continue
+
+            try:
+                summaries = _fetch_customer_summaries(uid, phone)
+                analysis_text = _invoke_customer_analysis(phone, summaries)
+                if analysis_text:
+                    _save_customer_analysis(uid, phone, analysis_text, call_count)
+                    result["updated"] += 1
+                else:
+                    result["failed"] += 1
+            except Exception as e:
+                logger.error(f"[CustomerAI] 분석 실패 phone={phone}: {e}")
+                result["failed"] += 1
+
+        logger.info(f"[CustomerAI] 배치 완료: {result}")
+    except Exception as e:
+        logger.exception(f"[CustomerAI] 배치 오류: {e}")
+    return {"statusCode": 200, "body": json.dumps(result, ensure_ascii=False)}
+
+
+def _fetch_customer_summaries(uid: str, phone: str) -> list[str]:
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT s.summary, s.category
+                FROM calls c
+                LEFT JOIN summaries s ON s.call_id = c.id
+                WHERE c.user_id = %s AND c.caller_number = %s
+                ORDER BY c.created_at DESC
+                LIMIT 20
+            """, (uid, phone))
+            rows = cur.fetchall()
+    out = []
+    for r in rows:
+        summ = (r.get("summary") or "").strip()
+        cat = (r.get("category") or "").strip()
+        if summ:
+            out.append(f"[{cat}] {summ}" if cat else summ)
+    return out
+
+
+def _invoke_customer_analysis(phone: str, summaries: list[str]) -> str | None:
+    """nlp Lambda를 호출해 고객 종합 분석문 생성."""
+    if not summaries:
+        return None
+    try:
+        response = lambda_client.invoke(
+            FunctionName="call-recorder-api-nlp",
+            InvocationType="RequestResponse",
+            Payload=json.dumps({
+                "task": "customer_analysis",
+                "phone": phone,
+                "summaries": summaries,
+            }).encode(),
+        )
+        payload = json.loads(response["Payload"].read())
+        body = json.loads(payload.get("body", "{}"))
+        return (body.get("analysis") or "").strip() or None
+    except Exception as e:
+        logger.error(f"[CustomerAI] nlp invoke 실패 phone={phone}: {e}")
+        return None
+
+
+def _save_customer_analysis(uid: str, phone: str, analysis: str, call_count: int) -> None:
+    sql = """
+        INSERT INTO customer_analysis (id, user_id, phone, analysis, call_count, generated_at)
+        VALUES (%s, %s, %s, %s, %s, NOW())
+        ON DUPLICATE KEY UPDATE
+            analysis = VALUES(analysis),
+            call_count = VALUES(call_count),
+            generated_at = NOW()
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (str(uuid.uuid4()), uid, phone, analysis, call_count))
+        conn.commit()
 
 
 def _response(status: int, body: dict, event: dict = None) -> dict:

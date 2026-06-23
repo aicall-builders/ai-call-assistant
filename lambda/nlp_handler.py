@@ -514,6 +514,9 @@ def analyze_with_gpt(call_id: str, transcript: str, base_matches: list[dict] | N
 
 # ── Lambda 핸들러 ──────────────────────────────────────────────────────────────
 def lambda_handler(event: dict, context) -> dict:
+    if event.get("task") == "customer_analysis":
+        return _handle_customer_analysis(event)
+
     if event.get("call_id") and event.get("transcript"):
         transcript = event["transcript"]
         store_id = event.get("store_id") or ""
@@ -585,6 +588,43 @@ def _handle_nlp(event: dict) -> dict:
     except Exception as e:
         logger.exception(f"[NLP] 처리 오류: {e}")
         return _response(500, {"error": "내부 오류"})
+
+
+def _handle_customer_analysis(event: dict) -> dict:
+    """
+    고객의 통화 요약들을 종합해 한 단락짜리 'AI 고객 분석'을 생성.
+    입력: {"task":"customer_analysis", "phone": "...", "summaries": ["[예약] ...", ...]}
+    출력: {"analysis": "..."}
+    """
+    phone = event.get("phone") or ""
+    summaries = event.get("summaries") or []
+    if not summaries:
+        return _response(200, {"analysis": ""})
+
+    joined = "\n".join(f"- {s}" for s in summaries[:20])
+    prompt = (
+        "당신은 소상공인을 돕는 고객관리 비서입니다. "
+        "아래는 한 고객과의 통화 요약 목록입니다. 이 고객의 특징을 사장님이 한눈에 파악할 수 있도록 "
+        "2~3문장으로 자연스러운 한국어 단락으로 요약하세요. "
+        "자주 묻는 내용, 선호/주의사항(예: 좌석 선호, 알레르기 등)이 있으면 반영하고, "
+        "개인정보를 추측해 지어내지 마세요. 마크다운 없이 평문으로만 답하세요.\n\n"
+        f"[통화 요약]\n{joined}\n\n[고객 분석]"
+    )
+
+    try:
+        client = openai.OpenAI(api_key=OPENAI_API_KEY, timeout=55.0)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+            max_tokens=300,
+        )
+        text = response.choices[0].message.content.strip()
+        logger.info(f"[NLP] 고객 분석 완료 phone={phone} len={len(text)}")
+        return _response(200, {"analysis": text})
+    except Exception as e:
+        logger.error(f"[NLP] 고객 분석 오류 phone={phone}: {e}")
+        return _response(500, {"analysis": "", "error": str(e)})
 
 
 def _response(status: int, body: dict) -> dict:
