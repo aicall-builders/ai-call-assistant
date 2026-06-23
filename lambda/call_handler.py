@@ -1222,40 +1222,50 @@ def _run_customer_analysis_batch() -> dict:
     """
     EventBridge(하루 2회) 진입점. 통화가 있는 (user_id, phone)별로
     통화 요약들을 모아 nlp Lambda의 고객 분석을 호출 → customer_analysis 저장.
-    GPT 비용 절약을 위해 마지막 분석 이후 통화 수가 변한 고객만 갱신.
+    GPT 비용/시간 절약을 위해: 통화 수가 변한 고객만, 1회 최대 MAX_PER_RUN명만 갱신.
     """
+    MAX_PER_RUN = 15  # 한 번 실행에서 GPT 호출할 최대 고객 수 (타임아웃 방지)
     logger.info("[CustomerAI] 배치 시작")
-    result = {"targets": 0, "updated": 0, "skipped": 0, "failed": 0}
+    result = {"targets": 0, "updated": 0, "skipped": 0, "failed": 0, "remaining": 0}
     try:
+        # 1) 고객별 통화 수 (가벼운 집계만)
         with get_db() as conn:
             with conn.cursor() as cur:
-                # 고객별 통화 수 + 최신 분석 시점의 call_count 비교
                 cur.execute("""
-                    SELECT c.user_id, c.caller_number AS phone,
-                           COUNT(*) AS call_count,
-                           COALESCE(a.call_count, -1) AS analyzed_count
-                    FROM calls c
-                    LEFT JOIN customer_analysis a
-                           ON a.user_id = c.user_id AND a.phone = c.caller_number
-                    WHERE c.caller_number IS NOT NULL AND c.caller_number <> ''
-                    GROUP BY c.user_id, c.caller_number, a.call_count
+                    SELECT user_id, caller_number AS phone, COUNT(*) AS call_count
+                    FROM calls
+                    WHERE caller_number IS NOT NULL AND caller_number <> ''
+                    GROUP BY user_id, caller_number
                 """)
-                rows = cur.fetchall()
+                call_rows = cur.fetchall()
 
-        result["targets"] = len(rows)
-        for row in rows:
-            uid = row["user_id"]
-            phone = row["phone"]
-            call_count = int(row["call_count"])
-            analyzed = int(row["analyzed_count"])
+                # 2) 이미 분석된 고객의 call_count 맵 (한 번에 조회)
+                cur.execute("SELECT user_id, phone, call_count FROM customer_analysis")
+                analyzed_rows = cur.fetchall()
 
-            # 통화 수 변동 없으면 스킵
-            if call_count == analyzed:
+        analyzed_map = {(r["user_id"], r["phone"]): int(r["call_count"]) for r in analyzed_rows}
+        result["targets"] = len(call_rows)
+        logger.info(f"[CustomerAI] 집계 완료 targets={len(call_rows)} analyzed={len(analyzed_rows)}")
+
+        # 변동된 고객만 추림
+        todo = []
+        for row in call_rows:
+            key = (row["user_id"], row["phone"])
+            cc = int(row["call_count"])
+            if analyzed_map.get(key, -1) == cc:
                 result["skipped"] += 1
-                continue
+            else:
+                todo.append((row["user_id"], row["phone"], cc))
 
+        # 1회 처리량 제한
+        result["remaining"] = max(0, len(todo) - MAX_PER_RUN)
+        todo = todo[:MAX_PER_RUN]
+
+        logger.info(f"[CustomerAI] 분석 대상 {len(todo)}명 (남은 {result['remaining']}명)")
+        for uid, phone, call_count in todo:
             try:
                 summaries = _fetch_customer_summaries(uid, phone)
+                logger.info(f"[CustomerAI] nlp 호출 phone={phone} 요약 {len(summaries)}건")
                 analysis_text = _invoke_customer_analysis(phone, summaries)
                 if analysis_text:
                     _save_customer_analysis(uid, phone, analysis_text, call_count)
