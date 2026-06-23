@@ -382,8 +382,7 @@ def _insert_summary(call_id: str, result: dict) -> None:
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, (
-                str(uuid.uuid4()), call_id,    if path == "/migrate/caller-name" and method == "POST":
-                
+                str(uuid.uuid4()), call_id,                
                 summary_str,
                 result.get("category", "기타"),
                 result.get("domain", "기타"),
