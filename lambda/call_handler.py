@@ -907,6 +907,14 @@ def _handle_upload(event: dict) -> dict:
         s3_key           = f"recordings/{store_id}/{call_id}/{file_name}"
         counterpart_number = body.get("counterpart_number", "").strip()  # ← 추가
 
+        # 통화 길이(초) — 앱이 duration_seconds로 보냄. 없으면 0.
+        try:
+            duration_sec = int(body.get("duration_seconds") or 0)
+        except (TypeError, ValueError):
+            duration_sec = 0
+        if duration_sec < 0:
+            duration_sec = 0
+
         upload_url = s3.generate_presigned_url(
             "put_object",
             Params={
@@ -918,12 +926,12 @@ def _handle_upload(event: dict) -> dict:
         )
 
         sql = """
-            INSERT INTO calls (id, store_id, user_id, s3_key, status, caller_number)
-            VALUES (%s, %s, %s, %s, 'uploaded', %s)
+            INSERT INTO calls (id, store_id, user_id, s3_key, status, caller_number, duration)
+            VALUES (%s, %s, %s, %s, 'uploaded', %s, %s)
         """
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (call_id, store_id, uid, s3_key, counterpart_number))  # ← 추가
+                cur.execute(sql, (call_id, store_id, uid, s3_key, counterpart_number, duration_sec))
             conn.commit()
 
         return _response(200, {
