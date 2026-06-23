@@ -382,7 +382,8 @@ def _insert_summary(call_id: str, result: dict) -> None:
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, (
-                str(uuid.uuid4()), call_id,
+                str(uuid.uuid4()), call_id,    if path == "/migrate/caller-name" and method == "POST":
+                
                 summary_str,
                 result.get("category", "기타"),
                 result.get("domain", "기타"),
@@ -475,6 +476,8 @@ def lambda_handler(event: dict, context) -> dict:
         return _migrate_caller_stats()
     if event.get("action") == "migrate_custom_keywords":
         return _migrate_custom_keywords()
+    if event.get("action") == "migrate_user_domain":
+        return _handle_migrate_user_domain(event)
         
     path   = _normalize_path(event)
     method = _method(event)
