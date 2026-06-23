@@ -1266,11 +1266,20 @@ def _run_customer_analysis_batch() -> dict:
             try:
                 summaries = _fetch_customer_summaries(uid, phone)
                 logger.info(f"[CustomerAI] nlp 호출 phone={phone} 요약 {len(summaries)}건")
+
+                # 요약이 아예 없는 고객 → 분석할 내용 없음.
+                # 빈 분석을 call_count와 함께 저장해 다음 실행에서 skip 되게 함(무한 반복 방지).
+                if not summaries:
+                    _save_customer_analysis(uid, phone, "", call_count)
+                    result["skipped"] += 1
+                    continue
+
                 analysis_text = _invoke_customer_analysis(phone, summaries)
                 if analysis_text:
                     _save_customer_analysis(uid, phone, analysis_text, call_count)
                     result["updated"] += 1
                 else:
+                    # GPT 호출 자체가 실패한 경우만 failed로 두고 다음 실행에서 재시도
                     result["failed"] += 1
             except Exception as e:
                 logger.error(f"[CustomerAI] 분석 실패 phone={phone}: {e}")
