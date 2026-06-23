@@ -481,8 +481,7 @@ def lambda_handler(event: dict, context) -> dict:
         return _migrate_customer_profiles()
     if event.get("action") == "generate_customer_analysis":
         return _run_customer_analysis_batch()
-    if event.get("action") == "diag_summaries":         
-        return _diag_summaries()   
+
     
     path   = _normalize_path(event)
     method = _method(event)
@@ -1351,39 +1350,7 @@ def _save_customer_analysis(uid: str, phone: str, analysis: str, call_count: int
         conn.commit()
         
     
-def _diag_summaries() -> dict:
-    target = "01033480834"
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT status, COUNT(*) AS cnt FROM calls GROUP BY status")
-            status_dist = cur.fetchall()
-            cur.execute("SELECT COUNT(*) AS cnt FROM summaries WHERE summary IS NOT NULL AND summary <> ''")
-            with_summary = (cur.fetchone() or {}).get("cnt", 0)
-            cur.execute("SELECT COUNT(*) AS cnt FROM calls")
-            total_calls = (cur.fetchone() or {}).get("cnt", 0)
-            cur.execute("SELECT COUNT(*) AS cnt FROM customer_analysis WHERE analysis IS NOT NULL AND analysis <> ''")
-            real_analysis = (cur.fetchone() or {}).get("cnt", 0)
-            cur.execute("SELECT phone FROM customer_analysis WHERE analysis <> '' LIMIT 5")
-            sample_phones = [r["phone"] for r in cur.fetchall()]
-            cur.execute(
-                "SELECT id, caller_number, caller_name, status FROM calls WHERE caller_number = %s OR caller_name = %s",
-                (target, target),
-            )
-            target_calls = cur.fetchall()
-            cur.execute(
-                "SELECT user_id, phone, call_count, CHAR_LENGTH(analysis) AS analen FROM customer_analysis WHERE phone = %s",
-                (target,),
-            )
-            target_analysis = cur.fetchall()
-    return {"statusCode": 200, "body": json.dumps({
-        "total_calls": total_calls,
-        "calls_with_summary": with_summary,
-        "status_distribution": status_dist,
-        "customers_with_real_analysis": real_analysis,
-        "sample_phones": sample_phones,
-        "target_calls": target_calls,
-        "target_analysis": target_analysis,
-    }, ensure_ascii=False, default=str)}
+
 
 def _response(status: int, body: dict, event: dict = None) -> dict:
     return {
