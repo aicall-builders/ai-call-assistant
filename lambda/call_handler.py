@@ -1352,6 +1352,7 @@ def _save_customer_analysis(uid: str, phone: str, analysis: str, call_count: int
         
     
 def _diag_summaries() -> dict:
+    target = "01033480834"
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT status, COUNT(*) AS cnt FROM calls GROUP BY status")
@@ -1364,12 +1365,24 @@ def _diag_summaries() -> dict:
             real_analysis = (cur.fetchone() or {}).get("cnt", 0)
             cur.execute("SELECT phone FROM customer_analysis WHERE analysis <> '' LIMIT 5")
             sample_phones = [r["phone"] for r in cur.fetchall()]
+            cur.execute(
+                "SELECT id, caller_number, caller_name, status FROM calls WHERE caller_number = %s OR caller_name = %s",
+                (target, target),
+            )
+            target_calls = cur.fetchall()
+            cur.execute(
+                "SELECT user_id, phone, call_count, CHAR_LENGTH(analysis) AS analen FROM customer_analysis WHERE phone = %s",
+                (target,),
+            )
+            target_analysis = cur.fetchall()
     return {"statusCode": 200, "body": json.dumps({
         "total_calls": total_calls,
         "calls_with_summary": with_summary,
         "status_distribution": status_dist,
         "customers_with_real_analysis": real_analysis,
         "sample_phones": sample_phones,
+        "target_calls": target_calls,
+        "target_analysis": target_analysis,
     }, ensure_ascii=False, default=str)}
 
 def _response(status: int, body: dict, event: dict = None) -> dict:
