@@ -6,8 +6,7 @@
 
 [📱 APK 다운로드](https://drive.google.com/file/d/1jJNRF2CCVcCKSpdIPUODjWL6F5exxJ-T/view?usp=sharing) 
 
-[모니터링 대시보드](http://15.165.17.218:3000/public-dashboards/97b5462a12b54bf9b827b07eeee699f4)
-
+[📊 모니터링 대시보드](http://15.165.17.218:3000/public-dashboards/97b5462a12b54bf9b827b07eeee699f4)
 
 [📖 메인 README](https://github.com/seongminj0613-tech/business-ai-assistant)
 
@@ -22,6 +21,7 @@
 - S3 presigned URL 발급
 - CLOVA Speech 비동기 호출 + Webhook 수신
 - 룰베이스 NLP + GPT-4o-mini 하이브리드 요약 처리
+- ElastiCache Redis 캐싱 (키워드 핫리로드 / 토큰 캐싱 / 중복 방지)
 
 > 안드로이드·웹 클라이언트는 별도 레포에서 관리됩니다. [관련 저장소](#-관련-저장소) 참조.
 
@@ -59,9 +59,9 @@ RDS / S3 / 외부 API
 
 ---
 
-### ✅ Phase 1: 핸들러 분리 구조 (현재)
+### ✅ Phase 1: 핸들러 분리 + Redis 캐싱 (현재)
 
-오류 분석 용이성과 독립 배포를 위해 **기능별 Lambda 분리**를 진행했습니다.
+오류 분석 용이성과 독립 배포를 위해 **기능별 Lambda 분리**를 진행하고, 공통 ElastiCache Redis 클러스터를 도입했습니다.
 
 ```
         Android / Web Client
@@ -70,7 +70,7 @@ RDS / S3 / 외부 API
                 ▼
    ┌─────────────────────────────────┐
    │  AWS API Gateway (REST API)     │
-   │  avrq2kzfp9 (ap-northeast-2)   │
+   │  avrq2kzfp9 · /prod (ap-ne-2)   │
    └────┬──────────┬──────────┬──────┘
         │          │          │
         ▼          ▼          ▼
@@ -82,8 +82,12 @@ RDS / S3 / 외부 API
 │ 로그인   │ │ calls    │ │ Webhook  │
 │ Firebase │ │ CRUD     │ │ LLM 요약 │
 └────┬─────┘ └────┬─────┘ └────┬─────┘
-     │             │             │
-     ▼             ▼             ▼
+     │            │            │
+     │   ┌────────┴────────┐   │   (3개 핸들러 공유)
+     ├──▶│ ElastiCache Redis│◀──┤
+     │   │ 키워드/토큰/락    │   │
+     │   └─────────────────┘   │
+     ▼            ▼            ▼
   Firebase       RDS/S3       CLOVA/GPT
 ```
 
@@ -91,7 +95,14 @@ RDS / S3 / 외부 API
 - 기능별 독립 배포 → 수정 범위 최소화
 - CloudWatch 로그가 핸들러별로 분리되어 에러 추적 용이
 - 인증 오류 / 통화 오류 / NLP 오류를 개별 모니터링 가능
+- Redis 캐싱으로 키워드 사전 무중단 갱신(102ms → 5ms) + Firebase 토큰 검증 비용 절감
 - 향후 기능별 독립 스케일링 기반 마련
+
+**Phase 1에서 함께 도입한 것:**
+- Redis 캐싱 — keywords 핫리로드 102ms → 5ms (20배 개선)
+- Firebase 토큰 캐싱 + 중복 업로드 방지 (SET NX 락)
+- CloudWatch + Slack 알림 연동
+- CLOVA Webhook 폴링 메커니즘 (5분 주기 자동 복구)
 
 ---
 
@@ -102,7 +113,8 @@ lambda/
   ├── auth_handler.py   # 카카오 로그인, Firebase Custom Token 발급
   ├── call_handler.py   # stores/calls CRUD, S3 업로드, STT 처리 시작
   ├── nlp_handler.py    # CLOVA Webhook 수신, LLM 요약 처리
-  ├── keywords.json     # 룰베이스 NLP 키워드 사전
+  ├── redis_client.py   # Redis 공통 연결 모듈 (RedisCluster, TLS)
+  ├── keywords.json     # 룰베이스 NLP 키워드 사전 (Redis 핫리로드 원본)
   ├── requirements.txt  # 의존성
   └── deploy.md         # 배포 절차
 ```
@@ -119,7 +131,8 @@ lambda/
 
 ### Runtime & Infrastructure
 - **AWS Lambda** (Python 3.12)
-- **AWS API Gateway** (REST API, `avrq2kzfp9`)
+- **AWS API Gateway** (REST API, `avrq2kzfp9`, `/prod` 스테이지)
+- **AWS ElastiCache Redis 7.1** (키워드 핫리로드 / Firebase 토큰 캐싱 / 중복 방지 락)
 - **AWS RDS MySQL 8.0** (db.t4g.micro, 프라이빗 서브넷)
 - **AWS S3** (Seoul 리전, SSE-S3 암호화)
 - **AWS Secrets Manager** (DB 자격증명, Firebase Admin SDK)
@@ -167,6 +180,7 @@ Lambda 15분 타임아웃 제약을 우회하기 위해 **CLOVA async 모드 + W
 ```
 1. 클라이언트 → POST /calls/upload
    └─ presigned URL 발급, calls INSERT (status='uploaded')
+   └─ Redis SET NX 락으로 동일 파일 중복 업로드 차단
 
 2. 클라이언트 → S3 직접 PUT (Lambda 경유 안 함)
 
@@ -180,13 +194,28 @@ Lambda 15분 타임아웃 제약을 우회하기 위해 **CLOVA async 모드 + W
 
 ### NLP 처리 (하이브리드)
 
+키워드 사전은 Redis에서 핫리로드되며, 재배포 없이 사전 갱신이 반영됩니다.
+
 | 단계 | 처리 방식 | LLM 사용 |
 |------|---------|--------|
-| 1. 의도 분류 | 키워드·패턴 룰 (8종 분류) | ❌ |
+| 1. 의도 분류 | 키워드·패턴 룰 (8종 분류, Redis 캐싱) | ❌ |
 | 2. 엔터티 추출 | 정규식·사전 (날짜·시간·인원·메뉴·전화번호) | ❌ |
 | 3. 구조화 카드 채우기 | 룰베이스 템플릿 슬롯 매핑 | ❌ |
 | 4. 룰 실패 케이스 보강 | 임계 초과 시에만 LLM 호출 | ⚠️ 일부 |
 | 5. 통화 요약 생성 | 룰 우선, 자연스러움 부족 시 LLM | ⚠️ 일부 |
+
+---
+
+## ⚡ Redis 캐싱 설계
+
+3개 Lambda 핸들러가 동일 ElastiCache Redis 클러스터(cluster mode, TLS)를 공유하며, `redis_client.py` 공통 모듈로 연결합니다.
+
+| 용도 | 동작 | 효과 |
+|------|------|------|
+| **키워드 핫리로드** | `keywords.json`을 Redis에 캐싱, 변경 시 무중단 갱신 | 조회 102ms → 5ms (20배) |
+| **Firebase 토큰 캐싱** | 검증된 ID Token을 TTL 캐싱 | 매 요청 Firebase 검증 호출 절감 |
+| **중복 업로드 방지** | 업로드 중 call_id를 `SET NX` 락 | 동일 파일 중복 INSERT 차단 |
+| **Rate Limiting (예정)** | INCR + EXPIRE 기반 (인프라 준비 완료) | Phase 2 적용 |
 
 ---
 
@@ -241,7 +270,7 @@ Lambda 환경변수에는 **식별자 성격의 값**만 두고, 비밀은 Secre
 
 ### 배포 절차 (Phase 1)
 1. 코드 수정 (`lambda/auth_handler.py`, `call_handler.py`, `nlp_handler.py`)
-2. AWS Console → Lambda → 해당 함수 → Deploy
+2. `main` 브랜치 push → GitHub Actions가 해당 함수 자동 배포
 3. Smoke test (인증·매장·통화 조회)
 
 | 수정 대상 | 배포 함수 |
@@ -263,18 +292,14 @@ Lambda 환경변수에는 **식별자 성격의 값**만 두고, 비밀은 Secre
 | API 서버 가용성 (월) | ≥ 99.5% |
 
 ---
-## ✅ Phase 1 추가 완료
-- Redis 캐싱 — keywords 핫리로드 102ms → 5ms (20배 개선)
-- Firebase 토큰 캐싱 + 중복 업로드 방지 (SET NX 락)
-- CloudWatch + Slack 알림 연동
-- CLOVA Webhook 폴링 메커니즘 (5분 주기 자동 복구)
 
 ## 📈 향후 로드맵 (Phase 2)
-- GitHub Actions 기반 자동 배포 파이프라인
+- Rate Limiting 적용 (Redis INCR + EXPIRE, 인프라 준비 완료)
 - 단위 테스트 추가
-- Grafana 대시보드
+- Grafana 대시보드 고도화
 - LLM 호출 PII 마스킹
 - 삼성 권한 다중화
+
 ---
 
 ## 🔗 관련 저장소
@@ -295,4 +320,4 @@ Lambda 환경변수에는 **식별자 성격의 값**만 두고, 비밀은 Secre
 
 ---
 
-*문서 기준: Tech Spec v3.0 (2026.05.20) — Phase 1 Lambda 분리 완료*
+*문서 기준: Tech Spec v3.0 (2026.05.20) — Phase 1 Lambda 분리 + Redis 캐싱 완료*
