@@ -113,9 +113,13 @@ def _require_user(event):
                 cur.execute("SELECT id FROM users WHERE firebase_uid=%s LIMIT 1", (firebase_uid,))
                 row = cur.fetchone()
         if not row:
-            # DB에 없으면 firebase_uid를 user_id로 임시 사용
-            logger.warning("[Calendar] 사용자 DB 미등록 firebase_uid=%s", firebase_uid)
-            return firebase_uid, None
+            # DB에 사용자가 없으면 임시 통과시키지 않고 명확히 거절한다.
+            # firebase_uid를 user_id로 대체하면 calendar_connections/events의
+            # user_id가 users.id(UUID)와 firebase_uid(provider:id)로 섞여
+            # 데이터 정합성이 깨지므로, 정상 로그인으로 users 행이 생성된
+            # 사용자만 통과시킨다.
+            logger.warning("[Calendar] 사용자 DB 미등록으로 거절 firebase_uid=%s", firebase_uid)
+            return None, _response(404, {"error": "등록되지 않은 사용자입니다. 다시 로그인해주세요."}, event)
         return row["id"], None
     except Exception as e:
         logger.exception("[Calendar] 사용자 조회 실패: %s", e)
