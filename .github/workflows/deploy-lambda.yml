@@ -44,7 +44,7 @@ jobs:
           aws lambda update-function-code \
             --function-name call-recorder-api-auth \
             --zip-file fileb://auth_handler.zip
-          echo "✅ auth_handler 배포 완료"
+          echo "??auth_handler 배포 ?�료"
 
   deploy-call:
     name: Deploy call_handler
@@ -58,7 +58,7 @@ jobs:
       - name: Check if call_handler changed
         id: check_call
         run: |
-          if git diff --name-only HEAD~1 HEAD | grep -qE "lambda/call_handler.py|lambda/notes_handler.py|lambda/keywords.json|lambda/requirements.txt|lambda/redis_client.py"; then
+          if git diff --name-only HEAD~1 HEAD | grep -qE "lambda/call_handler.py|lambda/calendar_handler.py|lambda/notes_handler.py|lambda/keywords.json|lambda/requirements.txt|lambda/redis_client.py"; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
@@ -84,7 +84,7 @@ jobs:
           aws lambda update-function-code \
             --function-name call-recorder-api-call \
             --zip-file fileb://call_handler.zip
-          echo "✅ call_handler 배포 완료"
+          echo "??call_handler 배포 ?�료"
 
   deploy-nlp:
     name: Deploy nlp_handler
@@ -124,7 +124,7 @@ jobs:
           aws lambda update-function-code \
             --function-name call-recorder-api-nlp \
             --zip-file fileb://nlp_handler.zip
-          echo "✅ nlp_handler 배포 완료"
+          echo "??nlp_handler 배포 ?�료"
 
   deploy-calendar:
     name: Deploy calendar_handler
@@ -164,4 +164,4 @@ jobs:
           aws lambda update-function-code \
             --function-name call-recorder-api-calendar \
             --zip-file fileb://calendar_handler.zip
-          echo "✅ calendar_handler 배포 완료"
+          echo "??calendar_handler 배포 ?�료"

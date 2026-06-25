@@ -1108,3 +1108,4 @@ def lambda_handler(event, context):
     except Exception as e:
         logger.exception("[Calendar] 라우팅 처리 실패")
         return _response(500, {"error": str(e)}, event)
+# redeploy: calendar fallback fix
