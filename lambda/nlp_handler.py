@@ -36,6 +36,12 @@ VALID_EVENT_STATUSES = {"confirmed", "tentative", "cancelled", "rejected", "inqu
 VALID_CALENDAR_ACTIONS = {"create", "update", "cancel", "none", "review_needed"}
 
 
+def _mask_phone(phone) -> str:
+    """전화번호 마스킹 (로그 PII 보호). 01012345678 -> 010****5678"""
+    p = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if len(p) < 8:
+        return "***"
+    return p[:3] + "****" + p[-4:]
 
 
 def _get_db_password() -> str:
@@ -374,7 +380,7 @@ def _validate_gpt_result(result: dict) -> dict:
     # SMS 90자 초과 시 자르기
     if len(sms["message"]) > 90:
         sms["message"] = sms["message"][:90]
-        
+
     # customer 검증  ← 여기부터 추가
     if not isinstance(result.get("customer"), dict):
         result["customer"] = {}
@@ -382,7 +388,7 @@ def _validate_gpt_result(result: dict) -> dict:
     cust["name"]  = cust.get("name", "")  if isinstance(cust.get("name"), str)  else ""
     cust["phone"] = cust.get("phone", "") if isinstance(cust.get("phone"), str) else ""
     cust["phone"] = "".join(ch for ch in cust["phone"] if ch.isdigit())  # 숫자만
-    # ← 여기까지    
+    # ← 여기까지
 
     # 캘린더/할 일 후보 검증
     if result.get("event_status") not in VALID_EVENT_STATUSES:
@@ -453,7 +459,7 @@ def analyze_with_gpt(call_id: str, transcript: str, base_matches: list[dict] | N
     "description": "일정 설명",
     "source_keywords": ["캘린더 후보 판단에 사용된 키워드"]
   }},
-  
+
   "customer": {{
     "name": "고객 성함 (언급 없으면 빈 문자열)",
     "phone": "고객 연락처, 숫자만 (예: 01012345678, 언급 없으면 빈 문자열)"
@@ -620,10 +626,10 @@ def _handle_customer_analysis(event: dict) -> dict:
             max_tokens=300,
         )
         text = response.choices[0].message.content.strip()
-        logger.info(f"[NLP] 고객 분석 완료 phone={phone} len={len(text)}")
+        logger.info(f"[NLP] 고객 분석 완료 phone={_mask_phone(phone)} len={len(text)}")
         return _response(200, {"analysis": text})
     except Exception as e:
-        logger.error(f"[NLP] 고객 분석 오류 phone={phone}: {e}")
+        logger.error(f"[NLP] 고객 분석 오류 phone={_mask_phone(phone)}: {e}")
         return _response(500, {"analysis": "", "error": str(e)})
 
 

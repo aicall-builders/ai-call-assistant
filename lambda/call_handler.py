@@ -66,6 +66,14 @@ def get_db():
 
 # ── 중복 업로드 체크 ──────────────────────────────────────────────────────────
 
+def _mask_phone(phone) -> str:
+    """전화번호 마스킹 (로그 PII 보호). 01012345678 -> 010****5678"""
+    p = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if len(p) < 8:
+        return "***"
+    return p[:3] + "****" + p[-4:]
+
+
 def _file_hash(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes).hexdigest()
 
@@ -1074,7 +1082,7 @@ def _upsert_caller_stats(call_id: str) -> None:
                     str(uuid.uuid4()), user_id, store_id, caller_number
                 ))
             conn.commit()
-        logger.info(f"[Stats] 누적 완료 caller={caller_number} user={user_id}")
+        logger.info(f"[Stats] 누적 완료 caller={_mask_phone(caller_number)} user={user_id}")
 
     except Exception as e:
         logger.error(f"[Stats] caller_stats 업데이트 실패: {e}")
@@ -1266,7 +1274,7 @@ def _run_customer_analysis_batch() -> dict:
         for uid, phone, call_count in todo:
             try:
                 summaries = _fetch_customer_summaries(uid, phone)
-                logger.info(f"[CustomerAI] nlp 호출 phone={phone} 요약 {len(summaries)}건")
+                logger.info(f"[CustomerAI] nlp 호출 phone={_mask_phone(phone)} 요약 {len(summaries)}건")
 
                 # 요약이 아예 없는 고객 → 분석할 내용 없음.
                 # 빈 분석을 call_count와 함께 저장해 다음 실행에서 skip 되게 함(무한 반복 방지).
@@ -1283,7 +1291,7 @@ def _run_customer_analysis_batch() -> dict:
                     # GPT 호출 자체가 실패한 경우만 failed로 두고 다음 실행에서 재시도
                     result["failed"] += 1
             except Exception as e:
-                logger.error(f"[CustomerAI] 분석 실패 phone={phone}: {e}")
+                logger.error(f"[CustomerAI] 분석 실패 phone={_mask_phone(phone)}: {e}")
                 result["failed"] += 1
 
         logger.info(f"[CustomerAI] 배치 완료: {result}")
@@ -1331,7 +1339,7 @@ def _invoke_customer_analysis(phone: str, summaries: list[str]) -> str | None:
         body = json.loads(payload.get("body", "{}"))
         return (body.get("analysis") or "").strip() or None
     except Exception as e:
-        logger.error(f"[CustomerAI] nlp invoke 실패 phone={phone}: {e}")
+        logger.error(f"[CustomerAI] nlp invoke 실패 phone={_mask_phone(phone)}: {e}")
         return None
 
 
