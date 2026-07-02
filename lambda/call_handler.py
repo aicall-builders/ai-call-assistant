@@ -507,6 +507,11 @@ def lambda_handler(event: dict, context) -> dict:
 
     routed_event = _event_with_path(event, path, method)
 
+    # customer consent/history routes
+    if path.startswith("/consent/") or path.startswith("/customers/"):
+        import customer_handler
+        return customer_handler.lambda_handler(routed_event, context)
+
     # auth 라우트
     if path.startswith("/auth/"):
         import auth_handler
@@ -899,6 +904,12 @@ def _handle_call_process(event: dict, call_id: str) -> dict:
                 call = cur.fetchone()
         if not call:
             return _response(404, {"error": "통화를 찾을 수 없습니다"})
+
+        import customer_handler
+        ok, reason = customer_handler.can_process_call(uid, call_id)
+        if not ok:
+            return _response(403, {"error": reason or "고객 동의가 필요합니다"})
+
         job_id = request_clova_stt(call_id, call["s3_key"])
         return _response(200, {"message": "STT 처리 시작", "clova_job_id": job_id})
     except Exception as e:
@@ -1301,6 +1312,12 @@ def _run_customer_analysis_batch() -> dict:
 
 
 def _fetch_customer_summaries(uid: str, phone: str) -> list[str]:
+    try:
+        import customer_handler
+        return customer_handler.fetch_customer_analysis_items(uid, phone)
+    except Exception as e:
+        logger.warning(f"[CustomerAI] 확장 히스토리 조회 실패, 기존 요약 조회로 fallback: {e}")
+
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
