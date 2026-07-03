@@ -478,7 +478,7 @@ def _handle_customer_get(event: dict, uid: str, phone: str) -> dict:
             analysis = cur.fetchone() or {}
 
     analysis = {k: (str(v) if hasattr(v, "isoformat") else v) for k, v in analysis.items()}
-    if profile.get("consent_status") != "consented":
+    if CONSENT_ENFORCEMENT and profile.get("consent_status") != "consented":
         analysis = {
             "analysis": "",
             "locked": True,
@@ -738,7 +738,7 @@ def _handle_history(event: dict, uid: str, phone: str) -> dict:
 def fetch_customer_analysis_items(uid: str, phone: str) -> list[str]:
     ensure_schema()
     phone = _normalize_phone(phone)
-    if not _is_consented(uid, phone):
+    if CONSENT_ENFORCEMENT and not _is_consented(uid, phone):
         return []
 
     items = []
