@@ -16,6 +16,7 @@ except Exception as import_error:
     RedisConnectionError = Exception
     logger.warning("[Redis] redis 패키지 없음. 캐시 없이 진행: %s", import_error)
 
+REDIS_DISABLED = os.environ.get("REDIS_DISABLED", "false").lower() in {"1", "true", "yes", "y"}
 REDIS_HOST     = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT     = int(os.environ.get("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD")
@@ -32,6 +33,8 @@ _client = None
 
 def get_redis():
     global _client
+    if REDIS_DISABLED:
+        return None
     if RedisCluster is None:
         return None
     try:
