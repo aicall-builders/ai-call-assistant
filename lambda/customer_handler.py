@@ -93,7 +93,7 @@ def _consent_base_url(event: dict) -> str:
 
 def _consent_url(event: dict, token: str) -> str:
     base = _consent_base_url(event)
-    path = f"/consent/{token}"
+    path = f"/consent?token={token}"
     return f"{base}{path}" if base else path
 
 
