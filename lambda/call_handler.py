@@ -130,6 +130,15 @@ def insert_call(user_id: str, store_id: str, s3_key: str,
         with conn.cursor() as cur:
             cur.execute(sql, (call_id, store_id, user_id, caller_number, s3_key))
         conn.commit()
+
+    if caller_number:
+        try:
+            import customer_handler
+            customer_handler.ensure_schema()
+            customer_handler._upsert_profile(user_id, caller_number, consent_status="pending")
+        except Exception as e:
+            logger.warning(f"[Customer] profile upsert skipped call_id={call_id} error={e}")
+
     logger.info(f"[Call] calls INSERT call_id={call_id}")
     return call_id
 
@@ -575,17 +584,11 @@ def lambda_handler(event: dict, context) -> dict:
     if path == "/calls/upload" and method == "POST":
         return _handle_upload(routed_event)
 
-    # customers (고객 프로필 + AI 분석)
-    #   GET  /customers/{phone}  → 프로필 + 분석 조회
-    #   PATCH /customers/{phone} → 편집 필드 저장
-    #   phone은 URL 인코딩되어 들어옴. 소유 통화에 있는 번호만 허용(BOLA 방지).
-    if path.startswith("/customers/"):
-        import urllib.parse
-        phone = urllib.parse.unquote(path.split("/", 2)[2])
-        if method == "GET":
-            return _handle_customer_get(routed_event, phone)
-        if method == "PATCH":
-            return _handle_customer_patch(routed_event, phone)
+    # customers
+    # customer_profiles 기준 고객 목록/상세/동의/메모/히스토리 공통 처리
+    if path == "/customers" or path.startswith("/customers/") or path.startswith("/consent/"):
+        import customer_handler
+        return customer_handler.lambda_handler(routed_event, context)
 
     # ── 임시 마이그레이션 라우트 제거됨 (보안) ──
     # /migrate/caller-name, /migrate/user-domain 공개 라우트는 인증 없이

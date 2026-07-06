@@ -1,4 +1,4 @@
-﻿import os
+import os
 import json
 import uuid
 import hashlib
@@ -460,6 +460,117 @@ def _handle_consent_submit(event: dict, token: str) -> dict:
     }, event)
 
 
+
+def _dt(v):
+    return str(v) if v is not None else ""
+
+
+def _handle_customers_list(event: dict, uid: str) -> dict:
+    """
+    고객 목록 조회.
+    기준:
+    - customer_profiles 우선
+    - calls에만 있는 caller_number도 병합
+    - 웹/앱 공통 API
+    """
+    ensure_schema()
+
+    profiles = {}
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    id, user_id, phone, name, email, tendency, medical, special_notes,
+                    custom_fields, consent_status, consented_at, consent_revoked_at,
+                    consent_version, created_at, updated_at
+                FROM customer_profiles
+                WHERE user_id=%s
+            """, (uid,))
+            for row in cur.fetchall() or []:
+                phone = _normalize_phone(row.get("phone"))
+                if not phone:
+                    continue
+                if isinstance(row.get("custom_fields"), str):
+                    try:
+                        row["custom_fields"] = json.loads(row["custom_fields"])
+                    except Exception:
+                        row["custom_fields"] = {}
+                profiles[phone] = {
+                    **{k: (str(v) if hasattr(v, "isoformat") else v) for k, v in row.items()},
+                    "phone": phone,
+                    "call_count": 0,
+                    "last_call_at": "",
+                    "latest_summary": "",
+                    "latest_category": "",
+                }
+
+            cur.execute("""
+                SELECT
+                    c.caller_number AS phone,
+                    COUNT(*) AS call_count,
+                    MAX(c.created_at) AS last_call_at,
+                    SUBSTRING_INDEX(
+                        GROUP_CONCAT(COALESCE(s.summary, '') ORDER BY c.created_at DESC SEPARATOR '\n---\n'),
+                        '\n---\n',
+                        1
+                    ) AS latest_summary,
+                    SUBSTRING_INDEX(
+                        GROUP_CONCAT(COALESCE(s.category, '') ORDER BY c.created_at DESC SEPARATOR '\n---\n'),
+                        '\n---\n',
+                        1
+                    ) AS latest_category
+                FROM calls c
+                LEFT JOIN summaries s ON s.call_id = c.id
+                WHERE c.user_id=%s
+                  AND c.caller_number IS NOT NULL
+                  AND c.caller_number <> ''
+                GROUP BY c.caller_number
+            """, (uid,))
+            call_rows = cur.fetchall() or []
+
+    for row in call_rows:
+        phone = _normalize_phone(row.get("phone"))
+        if not phone:
+            continue
+        if phone not in profiles:
+            profiles[phone] = {
+                "id": "",
+                "user_id": uid,
+                "phone": phone,
+                "name": "",
+                "email": "",
+                "tendency": "",
+                "medical": "",
+                "special_notes": "",
+                "custom_fields": {},
+                "consent_status": "pending",
+                "consented_at": "",
+                "consent_revoked_at": "",
+                "consent_version": CONSENT_VERSION,
+                "created_at": "",
+                "updated_at": "",
+                "call_count": 0,
+                "last_call_at": "",
+                "latest_summary": "",
+                "latest_category": "",
+            }
+
+        profiles[phone]["call_count"] = int(row.get("call_count") or 0)
+        profiles[phone]["last_call_at"] = _dt(row.get("last_call_at"))
+        profiles[phone]["latest_summary"] = row.get("latest_summary") or ""
+        profiles[phone]["latest_category"] = row.get("latest_category") or ""
+
+    customers = list(profiles.values())
+    customers.sort(
+        key=lambda x: x.get("last_call_at") or x.get("updated_at") or x.get("created_at") or "",
+        reverse=True,
+    )
+
+    return _response(200, {
+        "customers": customers,
+        "count": len(customers),
+    }, event)
+
 def _handle_customer_get(event: dict, uid: str, phone: str) -> dict:
     phone = _normalize_phone(phone)
     if not phone:
@@ -467,15 +578,19 @@ def _handle_customer_get(event: dict, uid: str, phone: str) -> dict:
     _upsert_profile(uid, phone)
     profile = _get_profile(uid, phone)
 
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT analysis, call_count, generated_at
-                FROM customer_analysis
-                WHERE user_id=%s AND phone=%s
-                LIMIT 1
-            """, (uid, phone))
-            analysis = cur.fetchone() or {}
+    analysis = {}
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT analysis, call_count, generated_at
+                    FROM customer_analysis
+                    WHERE user_id=%s AND phone=%s
+                    LIMIT 1
+                """, (uid, phone))
+                analysis = cur.fetchone() or {}
+    except Exception as e:
+        logger.warning("[Customer] analysis lookup skipped uid=%s phone=%s error=%s", uid, phone, e)
 
     analysis = {k: (str(v) if hasattr(v, "isoformat") else v) for k, v in analysis.items()}
     if CONSENT_ENFORCEMENT and profile.get("consent_status") != "consented":
@@ -831,6 +946,11 @@ def lambda_handler(event, context):
 
     if not parts or parts[0] != "customers":
         return _response(404, {"error": "Not found", "path": path}, event)
+
+    if len(parts) == 1:
+        if method == "GET":
+            return _handle_customers_list(event, uid)
+        return _response(405, {"error": "Method not allowed"}, event)
 
     if len(parts) < 2:
         return _response(400, {"error": "phone 필수"}, event)
