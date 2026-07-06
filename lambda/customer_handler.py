@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 s3 = boto3.client("s3")
+lambda_client = boto3.client("lambda")
 S3_BUCKET_NAME = os.environ.get("S3_BUCKET", "call-recoder-audio-1017")
 
 CONSENT_VERSION = os.environ.get("CONSENT_VERSION", "v1")
@@ -382,6 +383,28 @@ def _handle_consent_get(event: dict, token: str) -> dict:
     }, event)
 
 
+
+def _trigger_consented_call_processing(user_id: str, phone: str) -> None:
+    """
+    동의 완료 후 기존 uploaded 통화 처리 트리거.
+    비동기 invoke라 동의 응답 지연 최소화.
+    """
+    try:
+        lambda_client.invoke(
+            FunctionName=os.environ.get("CALL_PROCESSOR_FUNCTION", "call-recorder-api-call"),
+            InvocationType="Event",
+            Payload=json.dumps({
+                "action": "process_consented_calls",
+                "user_id": user_id,
+                "phone": phone,
+                "limit": 3,
+            }, ensure_ascii=False).encode("utf-8"),
+        )
+        logger.info("[Consent] processing trigger sent uid=%s phone=%s", user_id, phone)
+    except Exception as e:
+        logger.warning("[Consent] processing trigger failed uid=%s phone=%s error=%s", user_id, phone, e)
+
+
 def _handle_consent_submit(event: dict, token: str) -> dict:
     ensure_schema()
     body = _json_body(event)
@@ -452,6 +475,9 @@ def _handle_consent_submit(event: dict, token: str) -> dict:
                 WHERE id=%s
             """, (link["id"],))
         conn.commit()
+
+    if agreed:
+        _trigger_consented_call_processing(link["user_id"], phone)
 
     return _response(200, {
         "message": "동의 결과가 저장되었습니다",

@@ -74,6 +74,10 @@ def _mask_phone(phone) -> str:
     return p[:3] + "****" + p[-4:]
 
 
+def _normalize_phone_value(phone) -> str:
+    return "".join(ch for ch in str(phone or "") if ch.isdigit())
+
+
 def _file_hash(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes).hexdigest()
 
@@ -363,6 +367,13 @@ def _invoke_nlp(call_id: str, transcript: str) -> None:
                     with conn.cursor() as cur:
                         cur.execute("UPDATE calls SET caller_number = %s WHERE id = %s", (phone, call_id))
                     conn.commit()
+                try:
+                    import customer_handler
+                    if user_id:
+                        customer_handler.ensure_schema()
+                        customer_handler._upsert_profile(user_id, phone, consent_status="pending")
+                except Exception as e:
+                    logger.warning(f"[Customer] NLP profile upsert skipped call_id={call_id} error={e}")
             _upsert_caller_stats(call_id) 
             _update_call_status(call_id, status="completed")
         logger.info(f"[NLP] 분석 및 저장 완료 call_id={call_id}")
@@ -483,6 +494,100 @@ def _event_with_path(event: dict, path: str, method: str) -> dict:
     return copied
 
 
+
+def _s3_object_exists(s3_key: str) -> bool:
+    try:
+        s3.head_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+        return True
+    except Exception:
+        return False
+
+
+def _process_consented_calls(event: dict) -> dict:
+    """
+    동의 완료 고객의 기존 uploaded 통화 자동 처리.
+    - 동의 상태 확인
+    - S3 파일 존재 확인
+    - status=uploaded 인 항목만 원자적으로 processing 전환
+    - 중복 실행 방지
+    """
+    uid = event.get("user_id") or ""
+    phone = _normalize_phone_value(event.get("phone") or "")
+    try:
+        limit = max(1, min(int(event.get("limit") or 3), 5))
+    except Exception:
+        limit = 3
+
+    result = {"phone": phone, "checked": 0, "processed": 0, "skipped": 0, "failed": 0}
+
+    if not uid or not phone:
+        return {"statusCode": 400, "body": json.dumps({"error": "user_id/phone 필수"}, ensure_ascii=False)}
+
+    try:
+        import customer_handler
+        if not customer_handler._is_consented(uid, phone):
+            return {"statusCode": 200, "body": json.dumps({**result, "message": "동의 상태 아님"}, ensure_ascii=False)}
+    except Exception as e:
+        logger.warning(f"[ConsentProcess] consent check failed uid={uid} phone={_mask_phone(phone)} error={e}")
+        return {"statusCode": 200, "body": json.dumps({**result, "message": "동의 확인 실패"}, ensure_ascii=False)}
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, s3_key, caller_number, status
+                FROM calls
+                WHERE user_id=%s
+                  AND status IN ('uploaded', 'consent_required')
+                  AND caller_number IS NOT NULL
+                  AND caller_number <> ''
+                ORDER BY created_at ASC
+                LIMIT 100
+            """, (uid,))
+            rows = cur.fetchall() or []
+
+    for row in rows:
+        if result["processed"] >= limit:
+            break
+
+        result["checked"] += 1
+        call_id = row.get("id")
+        s3_key = row.get("s3_key") or ""
+        row_phone = _normalize_phone_value(row.get("caller_number") or "")
+
+        if row_phone != phone:
+            result["skipped"] += 1
+            continue
+
+        if not s3_key or not _s3_object_exists(s3_key):
+            result["skipped"] += 1
+            continue
+
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE calls
+                        SET status='processing', updated_at=NOW()
+                        WHERE id=%s
+                          AND user_id=%s
+                          AND status IN ('uploaded', 'consent_required')
+                    """, (call_id, uid))
+                    changed = cur.rowcount
+                conn.commit()
+
+            if not changed:
+                result["skipped"] += 1
+                continue
+
+            request_clova_stt(call_id, s3_key)
+            result["processed"] += 1
+        except Exception as e:
+            logger.warning(f"[ConsentProcess] call process failed call_id={call_id} error={e}")
+            result["failed"] += 1
+
+    return {"statusCode": 200, "body": json.dumps(result, ensure_ascii=False)}
+
+
 # ── Lambda 핸들러 ─────────────────────────────────────────────────────────────
 
 def lambda_handler(event: dict, context) -> dict:
@@ -498,6 +603,8 @@ def lambda_handler(event: dict, context) -> dict:
         return _migrate_customer_profiles()
     if event.get("action") == "generate_customer_analysis":
         return _run_customer_analysis_batch()
+    if event.get("action") == "process_consented_calls":
+        return _process_consented_calls(event)
 
     
     path   = _normalize_path(event)
@@ -949,7 +1056,12 @@ def _handle_upload(event: dict) -> dict:
 
         call_id          = str(uuid.uuid4())
         s3_key           = f"recordings/{store_id}/{call_id}/{file_name}"
-        counterpart_number = body.get("counterpart_number", "").strip()  # ← 추가
+        counterpart_number = (
+            body.get("caller_number")
+            or body.get("counterpart_number")
+            or body.get("phone")
+            or ""
+        ).strip()
 
         # 통화 길이(초) — 앱이 duration_seconds로 보냄. 없으면 0.
         try:
@@ -977,6 +1089,14 @@ def _handle_upload(event: dict) -> dict:
             with conn.cursor() as cur:
                 cur.execute(sql, (call_id, store_id, uid, s3_key, counterpart_number, duration_sec))
             conn.commit()
+
+        if counterpart_number:
+            try:
+                import customer_handler
+                customer_handler.ensure_schema()
+                customer_handler._upsert_profile(uid, counterpart_number, consent_status="pending")
+            except Exception as e:
+                logger.warning(f"[Customer] upload profile upsert skipped call_id={call_id} error={e}")
 
         return _response(200, {
             "call_id":        call_id,
