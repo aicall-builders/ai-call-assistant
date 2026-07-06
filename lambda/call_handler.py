@@ -631,7 +631,7 @@ def _assert_owns_store(uid: str, store_id: str) -> bool:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT 1 FROM stores WHERE id = %s AND owner_id = %s LIMIT 1",
+                    "SELECT 1 FROM stores WHERE id = %s AND user_id = %s LIMIT 1",
                     (store_id, uid),
                 )
                 return cur.fetchone() is not None
@@ -648,7 +648,7 @@ def _handle_stores_list(event: dict) -> dict:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, name, owner_id, created_at FROM stores WHERE owner_id = %s",
+                    "SELECT id, name, user_id, created_at FROM stores WHERE user_id = %s",
                     (uid,)
                 )
                 stores = cur.fetchall()
@@ -672,7 +672,7 @@ def _handle_stores_create(event: dict) -> dict:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO stores (id, name, owner_id) VALUES (%s, %s, %s)",
+                    "INSERT INTO stores (id, name, user_id) VALUES (%s, %s, %s)",
                     (store_id, name, uid)
                 )
             conn.commit()
