@@ -126,13 +126,13 @@ def insert_call(user_id: str, store_id: str, s3_key: str,
     call_id = str(uuid.uuid4())
     sql = """
         INSERT INTO calls
-            (id, store_id, user_id, caller_number, s3_key, status)
+            (id, store_id, user_id, caller_number, s3_key, status, direction)
         VALUES
-            (%s, %s, %s, %s, %s, 'uploaded')
+            (%s, %s, %s, %s, %s, 'uploaded', %s)
     """
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (call_id, store_id, user_id, caller_number, s3_key))
+            cur.execute(sql, (call_id, store_id, user_id, caller_number, s3_key, direction or 'unknown'))
         conn.commit()
 
     if caller_number:
@@ -1082,8 +1082,8 @@ def _handle_upload(event: dict) -> dict:
         )
 
         sql = """
-            INSERT INTO calls (id, store_id, user_id, s3_key, status, caller_number, duration)
-            VALUES (%s, %s, %s, %s, 'uploaded', %s, %s)
+            INSERT INTO calls (id, store_id, user_id, s3_key, status, caller_number, duration, direction)
+            VALUES (%s, %s, %s, %s, 'uploaded', %s, %s, %s)
         """
         with get_db() as conn:
             with conn.cursor() as cur:
