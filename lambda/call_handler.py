@@ -446,7 +446,18 @@ def _update_call_status(call_id: str, *, status: str,
         values.append(clova_job_id)
     if stt_result is not None:
         fields.append("stt_result = %s")
-        values.append(stt_result)
+        if stt_result == "":
+            values.append(None)
+        elif isinstance(stt_result, (dict, list)):
+            values.append(json.dumps(stt_result, ensure_ascii=False))
+        else:
+            text = str(stt_result).strip()
+            if not text:
+                values.append(None)
+            elif text.startswith("{") or text.startswith("["):
+                values.append(text)
+            else:
+                values.append(json.dumps({"text": text}, ensure_ascii=False))
     if error_message is not None:
         fields.append("error_message = %s")
         values.append(error_message)
