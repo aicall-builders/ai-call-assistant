@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from urllib.parse import unquote
 
 import boto3
+import requests
 
 from call_handler import get_db, _get_current_user_id, _response
 
@@ -144,6 +145,7 @@ def ensure_schema() -> None:
             _ensure_column(cur, "customer_profiles", "consented_at", "consented_at DATETIME NULL")
             _ensure_column(cur, "customer_profiles", "consent_revoked_at", "consent_revoked_at DATETIME NULL")
             _ensure_column(cur, "customer_profiles", "consent_version", "consent_version VARCHAR(20) NULL")
+            _ensure_column(cur, "customer_profiles", "is_pinned", "is_pinned TINYINT(1) NOT NULL DEFAULT 0")
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS consent_links (
@@ -207,6 +209,28 @@ def ensure_schema() -> None:
                     INDEX idx_user_phone (user_id, phone)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS customer_analysis (
+                    id VARCHAR(36) NOT NULL PRIMARY KEY,
+                    user_id VARCHAR(36) NOT NULL,
+                    phone VARCHAR(20) NOT NULL,
+                    analysis TEXT NULL,
+                    call_count INT NOT NULL DEFAULT 0,
+                    source_hash CHAR(64) NULL,
+                    status VARCHAR(20) NOT NULL DEFAULT 'ready',
+                    raw_json JSON NULL,
+                    generated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uq_customer_analysis_user_phone (user_id, phone),
+                    INDEX idx_user_phone (user_id, phone),
+                    INDEX idx_status (status)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            _ensure_column(cur, "customer_analysis", "source_hash", "source_hash CHAR(64) NULL")
+            _ensure_column(cur, "customer_analysis", "status", "status VARCHAR(20) NOT NULL DEFAULT 'ready'")
+            _ensure_column(cur, "customer_analysis", "raw_json", "raw_json JSON NULL")
+            _ensure_column(cur, "customer_analysis", "updated_at", "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
         conn.commit()
 
 
@@ -235,7 +259,7 @@ def _get_profile(uid: str, phone: str) -> dict:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT id, user_id, phone, name, email, tendency, medical, special_notes,
-                       custom_fields, consent_status, consented_at, consent_revoked_at,
+                       custom_fields, is_pinned, consent_status, consented_at, consent_revoked_at,
                        consent_version, created_at, updated_at
                 FROM customer_profiles
                 WHERE user_id = %s AND phone = %s
@@ -247,12 +271,14 @@ def _get_profile(uid: str, phone: str) -> dict:
             "phone": phone,
             "name": "",
             "consent_status": "pending",
+            "is_pinned": False,
         }
     if isinstance(row.get("custom_fields"), str):
         try:
             row["custom_fields"] = json.loads(row["custom_fields"])
         except Exception:
             row["custom_fields"] = {}
+    row["is_pinned"] = bool(row.get("is_pinned"))
     return {k: (str(v) if hasattr(v, "isoformat") else v) for k, v in row.items()}
 
 
@@ -507,7 +533,7 @@ def _handle_customers_list(event: dict, uid: str) -> dict:
             cur.execute("""
                 SELECT
                     id, user_id, phone, name, email, tendency, medical, special_notes,
-                    custom_fields, consent_status, consented_at, consent_revoked_at,
+                    custom_fields, is_pinned, consent_status, consented_at, consent_revoked_at,
                     consent_version, created_at, updated_at
                 FROM customer_profiles
                 WHERE user_id=%s
@@ -569,6 +595,7 @@ def _handle_customers_list(event: dict, uid: str) -> dict:
                 "medical": "",
                 "special_notes": "",
                 "custom_fields": {},
+                "is_pinned": False,
                 "consent_status": "pending",
                 "consented_at": "",
                 "consent_revoked_at": "",
@@ -585,10 +612,11 @@ def _handle_customers_list(event: dict, uid: str) -> dict:
         profiles[phone]["last_call_at"] = _dt(row.get("last_call_at"))
         profiles[phone]["latest_summary"] = row.get("latest_summary") or ""
         profiles[phone]["latest_category"] = row.get("latest_category") or ""
+        profiles[phone]["is_pinned"] = bool(profiles[phone].get("is_pinned"))
 
     customers = list(profiles.values())
     customers.sort(
-        key=lambda x: x.get("last_call_at") or x.get("updated_at") or x.get("created_at") or "",
+        key=lambda x: (1 if x.get("is_pinned") else 0, x.get("last_call_at") or x.get("updated_at") or x.get("created_at") or ""),
         reverse=True,
     )
 
@@ -609,7 +637,7 @@ def _handle_customer_get(event: dict, uid: str, phone: str) -> dict:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT analysis, call_count, generated_at
+                    SELECT analysis, call_count, generated_at, source_hash, status, raw_json, updated_at
                     FROM customer_analysis
                     WHERE user_id=%s AND phone=%s
                     LIMIT 1
@@ -618,6 +646,11 @@ def _handle_customer_get(event: dict, uid: str, phone: str) -> dict:
     except Exception as e:
         logger.warning("[Customer] analysis lookup skipped uid=%s phone=%s error=%s", uid, phone, e)
 
+    if isinstance(analysis.get("raw_json"), str):
+        try:
+            analysis["raw_json"] = json.loads(analysis["raw_json"])
+        except Exception:
+            analysis["raw_json"] = {}
     analysis = {k: (str(v) if hasattr(v, "isoformat") else v) for k, v in analysis.items()}
     if CONSENT_ENFORCEMENT and profile.get("consent_status") != "consented":
         analysis = {
@@ -638,42 +671,57 @@ def _handle_customer_patch(event: dict, uid: str, phone: str) -> dict:
         return _response(400, {"error": "phone 필수"}, event)
 
     body = _json_body(event)
-    name = (body.get("name") or "").strip()
-    email = (body.get("email") or "").strip()
-    tendency = (body.get("tendency") or "").strip()
-    medical = (body.get("medical") or "").strip()
-    special_notes = (body.get("special_notes") or "").strip()
-    custom_fields = body.get("custom_fields")
-    custom_json = json.dumps(custom_fields, ensure_ascii=False) if custom_fields is not None else None
+    allowed = {
+        "name": "name",
+        "email": "email",
+        "tendency": "tendency",
+        "medical": "medical",
+        "special_notes": "special_notes",
+        "custom_fields": "custom_fields",
+        "is_pinned": "is_pinned",
+    }
+
+    if not any(k in body for k in allowed):
+        return _response(400, {"error": "수정할 필드가 없습니다"}, event)
+
+    _upsert_profile(uid, phone)
+
+    fields = []
+    values = []
+    analysis_dirty = False
+
+    for req_key, col in allowed.items():
+        if req_key not in body:
+            continue
+
+        if req_key == "custom_fields":
+            fields.append("custom_fields=%s")
+            values.append(json.dumps(body.get(req_key) or {}, ensure_ascii=False))
+            analysis_dirty = True
+        elif req_key == "is_pinned":
+            fields.append("is_pinned=%s")
+            values.append(1 if bool(body.get(req_key)) else 0)
+        else:
+            value = (body.get(req_key) or "").strip()
+            fields.append(f"{col}=%s")
+            values.append(value or None)
+            analysis_dirty = True
+
+    fields.append("updated_at=CURRENT_TIMESTAMP")
+    values.extend([uid, phone])
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO customer_profiles
-                    (id, user_id, phone, name, email, tendency, medical, special_notes, custom_fields)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    name=VALUES(name),
-                    email=VALUES(email),
-                    tendency=VALUES(tendency),
-                    medical=VALUES(medical),
-                    special_notes=VALUES(special_notes),
-                    custom_fields=VALUES(custom_fields),
-                    updated_at=CURRENT_TIMESTAMP
-            """, (
-                str(uuid.uuid4()),
-                uid,
-                phone,
-                name or None,
-                email or None,
-                tendency or None,
-                medical or None,
-                special_notes or None,
-                custom_json,
-            ))
+            cur.execute(
+                f"UPDATE customer_profiles SET {', '.join(fields)} WHERE user_id=%s AND phone=%s",
+                values,
+            )
         conn.commit()
 
-    return _response(200, {"message": "고객 주요 정보 저장 완료"}, event)
+    if analysis_dirty:
+        _refresh_customer_analysis(uid, phone, reason="profile_patch")
+
+    return _response(200, {"message": "고객 정보 저장 완료"}, event)
 
 
 def _handle_memo_create(event: dict, uid: str, phone: str) -> dict:
@@ -697,6 +745,8 @@ def _handle_memo_create(event: dict, uid: str, phone: str) -> dict:
                 VALUES (%s, %s, %s, %s, 'manual', %s)
             """, (memo_id, uid, phone, memo, 1 if is_anonymized else 0))
         conn.commit()
+
+    _refresh_customer_analysis(uid, phone, reason="memo_create")
 
     return _response(201, {
         "id": memo_id,
@@ -773,6 +823,8 @@ def _handle_memo_photo_save(event: dict, uid: str, phone: str, memo_id: str) -> 
                     caption=VALUES(caption)
             """, (photo_id, memo_id, uid, phone, s3_key, caption))
         conn.commit()
+
+    _refresh_customer_analysis(uid, phone, reason="photo_save")
 
     return _response(201, {
         "id": photo_id,
@@ -945,6 +997,185 @@ def fetch_customer_analysis_items(uid: str, phone: str) -> list[str]:
             items.append("[수동 히스토리] " + " / ".join(parts))
 
     return items[:40]
+
+
+def _analysis_call_count(uid: str, phone: str) -> int:
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS cnt FROM calls WHERE user_id=%s AND caller_number=%s",
+                (uid, phone),
+            )
+            row = cur.fetchone() or {}
+    return int(row.get("cnt") or 0)
+
+
+def _build_customer_analysis_source(uid: str, phone: str) -> dict:
+    phone = _normalize_phone(phone)
+    profile = _get_profile(uid, phone)
+    items = fetch_customer_analysis_items(uid, phone)
+    return {
+        "profile": {
+            "phone": phone,
+            "name": profile.get("name") or "",
+            "email": profile.get("email") or "",
+            "tendency": profile.get("tendency") or "",
+            "medical": profile.get("medical") or "",
+            "special_notes": profile.get("special_notes") or "",
+            "custom_fields": profile.get("custom_fields") or {},
+            "is_pinned": bool(profile.get("is_pinned")),
+            "consent_status": profile.get("consent_status") or "pending",
+        },
+        "call_count": _analysis_call_count(uid, phone),
+        "items": items[:40],
+    }
+
+
+def _source_hash(source: dict) -> str:
+    return hashlib.sha256(json.dumps(source, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _fallback_customer_analysis(source: dict) -> dict:
+    profile = source.get("profile") or {}
+    items = source.get("items") or []
+    name = profile.get("name") or "해당 고객"
+    count = source.get("call_count") or 0
+
+    facts = []
+    for key, label in [
+        ("tendency", "성향"),
+        ("medical", "주의사항"),
+        ("special_notes", "특이사항"),
+    ]:
+        if profile.get(key):
+            facts.append(f"{label}: {profile[key]}")
+
+    recent = items[:5]
+    summary = f"{name}은 현재 누적 통화 {count}건의 고객입니다."
+    if facts:
+        summary += " " + " / ".join(facts)
+    if recent:
+        summary += " 최근 히스토리 기준으로 " + " ".join(recent[:2])[:400]
+
+    return {
+        "summary": summary[:1000],
+        "insights": recent[:3],
+        "recommended_actions": ["최근 통화·메모 내용을 확인하고 필요한 후속 조치를 진행하세요."],
+        "risk_flags": [],
+    }
+
+
+def _openai_customer_analysis(source: dict) -> dict | None:
+    api_key = os.environ.get("OPENAI_API_KEY") or ""
+    if not api_key:
+        return None
+
+    model = os.environ.get("CUSTOMER_ANALYSIS_MODEL", "gpt-4o-mini")
+    prompt = {
+        "instruction": "소상공인 고객관리용 AI 고객분석을 JSON으로 생성한다. 고객정보, 통화 히스토리, 메모, 이미지 설명을 모두 반영하되 과장하지 않는다.",
+        "output_schema": {
+            "summary": "2~3문장 고객 요약",
+            "insights": ["관찰 포인트"],
+            "recommended_actions": ["권장 후속 조치"],
+            "risk_flags": ["주의 플래그"],
+        },
+        "source": source,
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "응답은 JSON 객체만 반환한다."},
+                    {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+                ],
+                "temperature": 0.2,
+                "max_tokens": 700,
+            },
+            timeout=20,
+        )
+        if not resp.ok:
+            logger.warning("[CustomerAnalysis] OpenAI failed status=%s body=%s", resp.status_code, resp.text[:300])
+            return None
+        content = resp.json()["choices"][0]["message"]["content"]
+        return json.loads(content)
+    except Exception as e:
+        logger.warning("[CustomerAnalysis] OpenAI skipped error=%s", e)
+        return None
+
+
+def _refresh_customer_analysis(uid: str, phone: str, reason: str = "manual") -> dict:
+    ensure_schema()
+    phone = _normalize_phone(phone)
+    source = _build_customer_analysis_source(uid, phone)
+    h = _source_hash(source)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT source_hash, status
+                FROM customer_analysis
+                WHERE user_id=%s AND phone=%s
+                LIMIT 1
+            """, (uid, phone))
+            existing = cur.fetchone() or {}
+            if existing.get("source_hash") == h and existing.get("status") == "ready":
+                return {"skipped": True, "reason": "same_source_hash"}
+
+            cur.execute("""
+                INSERT INTO customer_analysis
+                    (id, user_id, phone, analysis, call_count, source_hash, status, raw_json, generated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, 'generating', %s, NOW())
+                ON DUPLICATE KEY UPDATE
+                    source_hash=VALUES(source_hash),
+                    status='generating',
+                    updated_at=CURRENT_TIMESTAMP
+            """, (
+                str(uuid.uuid4()),
+                uid,
+                phone,
+                "",
+                int(source.get("call_count") or 0),
+                h,
+                json.dumps({"reason": reason, "source": source}, ensure_ascii=False),
+            ))
+        conn.commit()
+
+    result = _openai_customer_analysis(source) or _fallback_customer_analysis(source)
+    analysis_text = result.get("summary") or ""
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO customer_analysis
+                    (id, user_id, phone, analysis, call_count, source_hash, status, raw_json, generated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, 'ready', %s, NOW())
+                ON DUPLICATE KEY UPDATE
+                    analysis=VALUES(analysis),
+                    call_count=VALUES(call_count),
+                    source_hash=VALUES(source_hash),
+                    status='ready',
+                    raw_json=VALUES(raw_json),
+                    generated_at=NOW(),
+                    updated_at=CURRENT_TIMESTAMP
+            """, (
+                str(uuid.uuid4()),
+                uid,
+                phone,
+                analysis_text,
+                int(source.get("call_count") or 0),
+                h,
+                json.dumps(result, ensure_ascii=False),
+            ))
+        conn.commit()
+
+    return {"skipped": False, "source_hash": h, "status": "ready"}
 
 
 def lambda_handler(event, context):

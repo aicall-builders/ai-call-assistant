@@ -122,7 +122,8 @@ def _content_type(ext: str) -> str:
 # ── calls 테이블 INSERT ───────────────────────────────────────────────────────
 
 def insert_call(user_id: str, store_id: str, s3_key: str,
-                caller_number: str = "", duration: int = 0) -> str:
+                caller_number: str = "", duration: int = 0,
+                direction: str = "unknown") -> str:
     call_id = str(uuid.uuid4())
     sql = """
         INSERT INTO calls
@@ -375,6 +376,12 @@ def _invoke_nlp(call_id: str, transcript: str) -> None:
                 except Exception as e:
                     logger.warning(f"[Customer] NLP profile upsert skipped call_id={call_id} error={e}")
             _upsert_caller_stats(call_id) 
+            try:
+                import customer_handler
+                if user_id and phone:
+                    customer_handler._refresh_customer_analysis(user_id, phone, reason="call_summary")
+            except Exception as e:
+                logger.warning(f"[CustomerAnalysis] refresh skipped call_id={call_id} error={e}")
             _update_call_status(call_id, status="completed")
         logger.info(f"[NLP] 분석 및 저장 완료 call_id={call_id}")
     except Exception as e:
