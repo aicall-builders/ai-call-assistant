@@ -183,6 +183,10 @@ def request_clova_stt(call_id: str, s3_key: str) -> str | None:
             raise ValueError(f"CLOVA {resp.status_code}: {resp.text}")
         data = resp.json()
         transcript = _extract_transcript(data)
+        if not (transcript or "").strip():
+            _update_call_status(call_id, status="error", error_message="STT 결과가 비어있습니다")
+            logger.warning(f"[CLOVA] STT 결과 없음 call_id={call_id}")
+            return None
         _update_call_status(call_id, status="transcribed", stt_result=transcript)
         logger.info(f"[CLOVA] STT 완료(sync) call_id={call_id} len={len(transcript)}")
         _invoke_nlp(call_id, transcript)
@@ -281,6 +285,10 @@ def _poll_clova(call_id: str, job_id: str, retry_count: int) -> bool:
 
         if status == "completed":
             transcript = _extract_transcript(data)
+            if not (transcript or "").strip():
+                _update_call_status(call_id, status="error", error_message="STT 결과가 비어있습니다")
+                logger.warning(f"[CLOVA] STT 결과 없음 call_id={call_id}")
+                return False
             _update_call_status(call_id, status="transcribed", stt_result=transcript)
             logger.info(f"[CLOVA] 완료 call_id={call_id}")
             _invoke_nlp(call_id, transcript)
@@ -461,6 +469,8 @@ def _update_call_status(call_id: str, *, status: str,
     if error_message is not None:
         fields.append("error_message = %s")
         values.append(error_message)
+    elif status != "error":
+        fields.append("error_message = NULL")
 
     values.append(call_id)
     sql = f"UPDATE calls SET {', '.join(fields)} WHERE id = %s"
