@@ -9,6 +9,8 @@ import uuid
 import hashlib
 import logging
 import base64
+from email.parser import BytesParser
+from email.policy import default as email_default_policy
 import boto3
 import pymysql
 import pymysql.cursors
@@ -1447,6 +1449,79 @@ def _handle_call_process(event: dict, call_id: str) -> dict:
         logger.exception(f"[Call] process 오류: {e}")
         return _response(500, {"error": "내부 오류"})
 
+def _event_body_bytes(event: dict) -> bytes:
+    raw_body = event.get("body") or ""
+    if isinstance(raw_body, bytes):
+        return raw_body
+    if event.get("isBase64Encoded"):
+        return base64.b64decode(raw_body)
+    return str(raw_body).encode("utf-8")
+
+
+def _strip_data_url(value: str) -> tuple[str, str]:
+    text = (value or "").strip()
+    if text.startswith("data:") and "," in text:
+        meta, payload = text.split(",", 1)
+        mime_type = meta[5:].split(";", 1)[0].strip()
+        return payload.strip(), mime_type
+    return text, ""
+
+
+def _parse_upload_payload(event: dict) -> tuple[dict, bytes | None, str, str]:
+    headers = event.get("headers") or {}
+    header_map = {str(k).lower(): str(v) for k, v in headers.items()}
+    content_type = header_map.get("content-type", "")
+    body_bytes = _event_body_bytes(event)
+    content_type_lower = content_type.lower()
+
+    if content_type_lower.startswith("audio/") or content_type_lower == "application/octet-stream":
+        fields = dict(event.get("queryStringParameters") or {})
+        file_name = fields.get("file_name") or fields.get("fileName") or "recording.m4a"
+        return fields, body_bytes, file_name, content_type
+
+    if content_type_lower.startswith("multipart/form-data"):
+        message_bytes = (
+            f"Content-Type: {content_type}\r\n"
+            "MIME-Version: 1.0\r\n\r\n"
+        ).encode("utf-8") + body_bytes
+        message = BytesParser(policy=email_default_policy).parsebytes(message_bytes)
+
+        fields: dict[str, str] = {}
+        file_bytes = None
+        file_name = ""
+        file_mime_type = ""
+
+        for part in message.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            filename = part.get_filename()
+            payload = part.get_payload(decode=True) or b""
+            if filename or name in ("file", "audio", "recording", "upload"):
+                file_bytes = payload
+                file_name = filename or fields.get("file_name") or "recording.m4a"
+                file_mime_type = part.get_content_type() or ""
+                continue
+            if name:
+                fields[name] = payload.decode("utf-8", errors="replace").strip()
+
+        return fields, file_bytes, file_name, file_mime_type
+
+    raw_text = body_bytes.decode("utf-8", errors="replace").strip()
+    body = json.loads(raw_text or "{}")
+    if not isinstance(body, dict):
+        raise ValueError("upload body must be a JSON object")
+
+    file_value = None
+    for key in ("file_base64", "audio_base64", "audio", "file", "data"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            file_value = value
+            break
+
+    if not file_value:
+        return body, None, "", ""
+
+    encoded, detected_mime_type = _strip_data_url(file_value)
+    return body, base64.b64decode(encoded), "", detected_mime_type
 
 
 def _handle_upload(event: dict) -> dict:
@@ -1460,10 +1535,10 @@ def _handle_upload(event: dict) -> dict:
         return _response(429, {"error": "요청 한도 초과. 잠시 후 다시 시도해주세요."}, event)
 
     try:
-        body      = json.loads(event.get("body") or "{}")
-        store_id  = body.get("store_id", "").strip()
-        file_name = body.get("file_name", "recording.m4a").strip()
-        mime_type = body.get("mime_type", "audio/mp4").strip()
+        body, file_bytes, uploaded_file_name, uploaded_mime_type = _parse_upload_payload(event)
+        store_id  = str(body.get("store_id") or body.get("storeId") or "").strip()
+        file_name = (uploaded_file_name or str(body.get("file_name") or body.get("fileName") or "recording.m4a")).strip()
+        mime_type = (uploaded_mime_type or str(body.get("mime_type") or body.get("mimeType") or "audio/mp4")).strip()
         if file_name.lower().endswith((".m4a", ".mp4")) or mime_type in ("audio/m4a", "audio/x-m4a"):
             mime_type = "audio/mp4"
 
@@ -1480,18 +1555,76 @@ def _handle_upload(event: dict) -> dict:
         s3_key           = f"recordings/{store_id}/{call_id}/{file_name}"
         counterpart_number = (
             body.get("caller_number")
+            or body.get("callerNumber")
             or body.get("counterpart_number")
+            or body.get("counterpartNumber")
             or body.get("phone")
             or ""
-        ).strip()
+        )
+        counterpart_number = str(counterpart_number).strip()
 
         # 통화 길이(초) — 앱이 duration_seconds로 보냄. 없으면 0.
         try:
-            duration_sec = int(body.get("duration_seconds") or 0)
+            duration_sec = int(body.get("duration_seconds") or body.get("durationSeconds") or 0)
         except (TypeError, ValueError):
             duration_sec = 0
         if duration_sec < 0:
             duration_sec = 0
+
+        if file_bytes is not None:
+            if not file_bytes:
+                return _response(400, {"error": "empty audio file"}, event)
+
+            duplicate, file_hash = check_and_lock_upload(uid, file_bytes)
+            if duplicate:
+                logger.warning(f"[Call] duplicate direct upload continuing uid={uid} hash={file_hash[:16]}")
+
+            s3.put_object(
+                Bucket=S3_BUCKET_NAME,
+                Key=s3_key,
+                Body=file_bytes,
+                ContentType=mime_type,
+                Metadata={
+                    "user_id": uid,
+                    "store_id": store_id,
+                    "file_hash": file_hash,
+                    "original_filename": file_name,
+                },
+            )
+            logger.info(f"[Call] direct upload S3 put complete call_id={call_id} key={s3_key} bytes={len(file_bytes)}")
+
+            sql = """
+                INSERT INTO calls (id, store_id, user_id, s3_key, status, caller_number, duration)
+                VALUES (%s, %s, %s, %s, 'uploaded', %s, %s)
+            """
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (call_id, store_id, uid, s3_key, counterpart_number, duration_sec))
+                conn.commit()
+            logger.info(f"[Call] direct upload calls INSERT call_id={call_id}")
+
+            if counterpart_number:
+                try:
+                    import customer_handler
+                    customer_handler.ensure_schema()
+                    customer_handler._upsert_profile(uid, counterpart_number, consent_status="pending")
+                except Exception as e:
+                    logger.warning(f"[Customer] upload profile upsert skipped call_id={call_id} error={e}")
+
+            job_id = request_clova_stt(call_id, s3_key)
+            if not job_id:
+                return _response(422, {
+                    "error": "CLOVA STT request failed",
+                    "call_id": call_id,
+                    "s3_key": s3_key,
+                }, event)
+
+            return _response(200, {
+                "call_id": call_id,
+                "s3_key": s3_key,
+                "status": "processing",
+                "clova_job_id": job_id,
+            }, event)
 
         upload_url = s3.generate_presigned_url(
             "put_object",
@@ -1511,6 +1644,7 @@ def _handle_upload(event: dict) -> dict:
             with conn.cursor() as cur:
                 cur.execute(sql, (call_id, store_id, uid, s3_key, counterpart_number, duration_sec))
             conn.commit()
+        logger.info(f"[Call] presigned upload calls INSERT call_id={call_id} key={s3_key}")
 
         if counterpart_number:
             try:
@@ -1527,6 +1661,9 @@ def _handle_upload(event: dict) -> dict:
             "upload_headers": {"Content-Type": mime_type},
         })
 
+    except (ValueError, json.JSONDecodeError) as e:
+        logger.warning(f"[Call] upload bad request: {e}")
+        return _response(400, {"error": "invalid upload request"}, event)
     except Exception as e:
         logger.exception(f"[Call] upload 오류: {e}")
         return _response(500, {"error": "내부 오류"})
