@@ -170,6 +170,18 @@ def _extract_clova_job_id(data: dict) -> str:
     return ""
 
 
+def _as_dict(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
 def _s3_object_size(s3_key: str) -> int:
     try:
         head = s3.head_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
@@ -238,7 +250,9 @@ def _request_clova_async(call_id: str, presigned_url: str) -> str | None:
         "language": "ko-KR",
         "completion": "async",
         "callback": callback_url,
-        "userdata": call_id,
+        "userdata": {
+            "call_id": str(call_id)
+        },
         "fullText": True,
         "diarization": {"enable": True},
     }
@@ -453,7 +467,31 @@ def _poll_clova(call_id: str, job_id: str, retry_count: int) -> bool:
 
 
 def _extract_transcript(data: dict) -> str:
-    segments = data.get("segments", [])
+    if not isinstance(data, dict):
+        return ""
+
+    for key in ("fullText", "text", "transcript"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    for parent_key in ("result", "data"):
+        parent = data.get(parent_key)
+        if isinstance(parent, dict):
+            for key in ("fullText", "text", "transcript"):
+                value = parent.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+    segments = data.get("segments") or []
+    if not segments:
+        for parent_key in ("result", "data"):
+            parent = data.get(parent_key)
+            if isinstance(parent, dict):
+                segments = parent.get("segments") or []
+                if segments:
+                    break
+
     if not segments:
         return data.get("text", "")
 
@@ -848,6 +886,7 @@ def lambda_handler(event: dict, context) -> dict:
     
     path   = _normalize_path(event)
     method = _method(event)
+    routed_event = _event_with_path(event, path, method)
 
     if path in ("/clova/callback", "/clova/webhook") and method == "POST":
         return _handle_clova_callback(routed_event)
@@ -862,8 +901,6 @@ def lambda_handler(event: dict, context) -> dict:
 
     if method == "OPTIONS":
         return _response(200, {"message": "OK"}, event)
-
-    routed_event = _event_with_path(event, path, method)
 
     # customer consent/history routes
     if path.startswith("/consent/") or path.startswith("/customers/"):
@@ -1292,12 +1329,15 @@ def _handle_clova_callback(event: dict) -> dict:
             raw_body = base64.b64decode(raw_body).decode("utf-8", errors="replace")
 
         data = json.loads(raw_body) if isinstance(raw_body, str) else raw_body
+        if not isinstance(data, dict):
+            data = {}
 
+        userdata = _as_dict(data.get("userdata") or data.get("userData"))
         call_id = (
-            data.get("userdata")
-            or data.get("userData")
-            or data.get("call_id")
+            data.get("call_id")
             or data.get("callId")
+            or userdata.get("call_id")
+            or userdata.get("callId")
         )
 
         job_id = _extract_clova_job_id(data)
