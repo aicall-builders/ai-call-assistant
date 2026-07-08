@@ -190,6 +190,7 @@ def _request_clova_sync(call_id: str, presigned_url: str) -> str | None:
         "url": presigned_url,
         "language": "ko-KR",
         "completion": "sync",
+        "resultToObs": True,
         "diarization": {"enable": True},
     }
 
