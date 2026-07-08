@@ -228,10 +228,18 @@ def _request_clova_async(call_id: str, presigned_url: str) -> str | None:
         "Content-Type": "application/json",
     }
 
+    callback_url = os.environ.get("CLOVA_CALLBACK_URL", "").strip()
+    if not callback_url:
+        _update_call_status(call_id, status="error", error_message="CLOVA_CALLBACK_URL 누락")
+        raise ValueError("CLOVA_CALLBACK_URL 누락")
+
     body = {
         "url": presigned_url,
         "language": "ko-KR",
         "completion": "async",
+        "callback": callback_url,
+        "userdata": call_id,
+        "fullText": True,
         "diarization": {"enable": True},
     }
 
@@ -841,6 +849,9 @@ def lambda_handler(event: dict, context) -> dict:
     path   = _normalize_path(event)
     method = _method(event)
 
+    if path in ("/clova/callback", "/clova/webhook") and method == "POST":
+        return _handle_clova_callback(routed_event)
+
     if event.get("source") == "aws.events":
         # EventBridge 규칙별 분기: detail.job == "customer_analysis" 면 분석 배치,
         # 아니면 기존 STT 폴링.
@@ -1273,6 +1284,67 @@ def _migrate_async_stt_columns(event: dict | None = None) -> dict:
     except Exception as e:
         logger.exception(f"[Migrate] async STT columns 오류: {e}")
         return _response(500, {"error": str(e)}, event or {})
+
+def _handle_clova_callback(event: dict) -> dict:
+    try:
+        raw_body = event.get("body") or "{}"
+        if event.get("isBase64Encoded"):
+            raw_body = base64.b64decode(raw_body).decode("utf-8", errors="replace")
+
+        data = json.loads(raw_body) if isinstance(raw_body, str) else raw_body
+
+        call_id = (
+            data.get("userdata")
+            or data.get("userData")
+            or data.get("call_id")
+            or data.get("callId")
+        )
+
+        job_id = _extract_clova_job_id(data)
+        transcript = (_extract_transcript(data) or "").strip()
+
+        if not call_id and job_id:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT id
+                        FROM calls
+                        WHERE clova_job_id = %s
+                        LIMIT 1
+                    """, (job_id,))
+                    row = cur.fetchone()
+                    call_id = row["id"] if row else None
+
+        if not call_id:
+            logger.error(f"[CLOVA_CALLBACK] call_id 없음 body={json.dumps(data, ensure_ascii=False)[:1500]}")
+            return _response(400, {"error": "call_id 없음"}, event)
+
+        if not transcript:
+            logger.warning(
+                f"[CLOVA_CALLBACK] transcript 없음 call_id={call_id} "
+                f"body={json.dumps(data, ensure_ascii=False)[:1500]}"
+            )
+            return _response(202, {"message": "callback received, transcript pending", "call_id": call_id}, event)
+
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT status FROM calls WHERE id = %s LIMIT 1", (call_id,))
+                row = cur.fetchone()
+
+        if row and row.get("status") == "completed":
+            logger.info(f"[CLOVA_CALLBACK] already completed call_id={call_id}")
+            return _response(200, {"message": "already completed", "call_id": call_id}, event)
+
+        _update_call_status(call_id, status="transcribed", stt_result=transcript)
+        logger.info(f"[CLOVA_CALLBACK] STT 완료 call_id={call_id} len={len(transcript)}")
+
+        _invoke_nlp(call_id, transcript)
+
+        return _response(200, {"message": "callback processed", "call_id": call_id}, event)
+
+    except Exception as e:
+        logger.exception(f"[CLOVA_CALLBACK] 오류: {e}")
+        return _response(500, {"error": str(e)}, event)
 
 def _handle_call_process(event: dict, call_id: str) -> dict:
     uid = _get_current_user_id(event)
