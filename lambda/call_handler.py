@@ -818,6 +818,9 @@ def _migrate_missing_upload_columns() -> dict:
 def lambda_handler(event: dict, context) -> dict:
     if event.get("action") == "migrate_missing_upload_columns":
         return _migrate_missing_upload_columns()
+    
+    if event.get("action") == "migrate_async_stt_columns":
+        return _migrate_async_stt_columns(event)
     if event.get("action") == "clean_extracted_info":
         return _clean_extracted_info()
     if event.get("action") == "migrate_caller_stats": 
@@ -1229,6 +1232,46 @@ def _handle_call_audio(event: dict, call_id: str) -> dict:
         logger.exception(f"[Call] audio 오류: {e}")
         return _response(500, {"error": "내부 오류"})
 
+
+
+def _migrate_async_stt_columns(event: dict | None = None) -> dict:
+    """
+    async STT용 calls 컬럼 추가. 멱등.
+    """
+    try:
+        changed = []
+
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                def has_col(table_name: str, column_name: str) -> bool:
+                    cur.execute("""
+                        SELECT COUNT(*) AS cnt
+                        FROM information_schema.columns
+                        WHERE table_schema = DATABASE()
+                          AND table_name = %s
+                          AND column_name = %s
+                    """, (table_name, column_name))
+                    return int((cur.fetchone() or {}).get("cnt", 0)) > 0
+
+                if not has_col("calls", "clova_job_id"):
+                    cur.execute("ALTER TABLE calls ADD COLUMN clova_job_id VARCHAR(255) NULL")
+                    changed.append("calls.clova_job_id")
+
+                if not has_col("calls", "retry_count"):
+                    cur.execute("ALTER TABLE calls ADD COLUMN retry_count INT NOT NULL DEFAULT 0")
+                    changed.append("calls.retry_count")
+
+            conn.commit()
+
+        logger.info(f"[Migrate] async STT columns changed={changed}")
+        return _response(200, {
+            "message": "async STT columns migrated",
+            "changed": changed,
+        }, event or {})
+
+    except Exception as e:
+        logger.exception(f"[Migrate] async STT columns 오류: {e}")
+        return _response(500, {"error": str(e)}, event or {})
 
 def _handle_call_process(event: dict, call_id: str) -> dict:
     uid = _get_current_user_id(event)
