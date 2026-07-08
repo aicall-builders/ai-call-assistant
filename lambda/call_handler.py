@@ -150,9 +150,129 @@ def insert_call(user_id: str, store_id: str, s3_key: str,
 
 # ── CLOVA STT 동기 요청 ───────────────────────────────────────────────────────
 
+def _extract_clova_job_id(data: dict) -> str:
+    if not isinstance(data, dict):
+        return ""
+
+    for key in ("token", "job_id", "jobId", "id", "requestId", "taskId"):
+        value = data.get(key)
+        if value:
+            return str(value)
+
+    for parent_key in ("result", "data", "job", "task"):
+        parent = data.get(parent_key)
+        if isinstance(parent, dict):
+            for key in ("token", "job_id", "jobId", "id", "requestId", "taskId"):
+                value = parent.get(key)
+                if value:
+                    return str(value)
+
+    return ""
+
+
+def _s3_object_size(s3_key: str) -> int:
+    try:
+        head = s3.head_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+        return int(head.get("ContentLength") or 0)
+    except Exception as e:
+        logger.warning(f"[CLOVA] S3 size check skipped key={s3_key}: {e}")
+        return 0
+
+
+def _request_clova_sync(call_id: str, presigned_url: str) -> str | None:
+    headers = {
+        "Accept": "application/json",
+        "X-CLOVASPEECH-API-KEY": CLOVA_SPEECH_SECRET_KEY,
+        "Content-Type": "application/json",
+    }
+
+    body = {
+        "url": presigned_url,
+        "language": "ko-KR",
+        "completion": "sync",
+        "diarization": {"enable": True},
+    }
+
+    resp = requests.post(
+        f"{CLOVA_SPEECH_INVOKE_URL}/recognizer/url",
+        headers=headers,
+        json=body,
+        timeout=120,
+    )
+
+    if not resp.ok:
+        logger.warning(f"[CLOVA] sync 실패 {resp.status_code}: {resp.text[:1000]}")
+        return None
+
+    data = resp.json()
+    transcript = (_extract_transcript(data) or "").strip()
+
+    if not transcript:
+        logger.warning(
+            f"[CLOVA] sync 결과 없음 call_id={call_id} "
+            f"body={json.dumps(data, ensure_ascii=False)[:1000]}"
+        )
+        return None
+
+    _update_call_status(call_id, status="transcribed", stt_result=transcript)
+    logger.info(f"[CLOVA] STT 완료(sync) call_id={call_id} len={len(transcript)}")
+    _invoke_nlp(call_id, transcript)
+    return call_id
+
+
+def _request_clova_async(call_id: str, presigned_url: str) -> str | None:
+    headers = {
+        "Accept": "application/json",
+        "X-CLOVASPEECH-API-KEY": CLOVA_SPEECH_SECRET_KEY,
+        "Content-Type": "application/json",
+    }
+
+    body = {
+        "url": presigned_url,
+        "language": "ko-KR",
+        "completion": "async",
+        "diarization": {"enable": True},
+    }
+
+    resp = requests.post(
+        f"{CLOVA_SPEECH_INVOKE_URL}/recognizer/url",
+        headers=headers,
+        json=body,
+        timeout=30,
+    )
+
+    if not resp.ok:
+        logger.error(f"[CLOVA] async 요청 실패 {resp.status_code}: {resp.text[:1000]}")
+        raise ValueError(f"CLOVA async {resp.status_code}: {resp.text[:500]}")
+
+    data = resp.json()
+
+    transcript = (_extract_transcript(data) or "").strip()
+    if transcript:
+        _update_call_status(call_id, status="transcribed", stt_result=transcript)
+        logger.info(f"[CLOVA] STT 완료(immediate) call_id={call_id} len={len(transcript)}")
+        _invoke_nlp(call_id, transcript)
+        return call_id
+
+    job_id = _extract_clova_job_id(data)
+    logger.info(
+        f"[CLOVA] async 응답 call_id={call_id} "
+        f"job_id={job_id or '-'} body={json.dumps(data, ensure_ascii=False)[:1500]}"
+    )
+
+    if not job_id:
+        _update_call_status(call_id, status="error", error_message="CLOVA async job_id 없음")
+        return None
+
+    _update_call_status(call_id, status="processing", clova_job_id=job_id)
+    logger.info(f"[CLOVA] async 접수 call_id={call_id} job_id={job_id}")
+    return job_id
+
+
 def request_clova_stt(call_id: str, s3_key: str) -> str | None:
     """
-    CLOVA Sync STT 요청 → 결과 바로 반환 후 NLP 호출.
+    작은 파일은 sync, 큰 파일은 async.
+    STT_SYNC_MAX_BYTES 이하만 sync 시도. 기본 1.2MB.
     """
     presigned_url = s3.generate_presigned_url(
         "get_object",
@@ -160,123 +280,24 @@ def request_clova_stt(call_id: str, s3_key: str) -> str | None:
         ExpiresIn=3600,
     )
 
-    logger.info(
-        f"[CLOVA_ENV] url={CLOVA_SPEECH_INVOKE_URL} "
-        f"secret_len={len(CLOVA_SPEECH_SECRET_KEY)} "
-        f"secret_prefix={CLOVA_SPEECH_SECRET_KEY[:4]} "
-        f"secret_suffix={CLOVA_SPEECH_SECRET_KEY[-4:]}"
-    )
-
-    headers = {
-        "Accept":                "application/json",
-        "X-CLOVASPEECH-API-KEY": CLOVA_SPEECH_SECRET_KEY,
-        "Content-Type":          "application/json",
-    }
-    
-    body = {
-        "url":        presigned_url,
-        "language":   "ko-KR",
-        "completion": "sync",
-        "diarization": {"enable": True},
-        }
-
     try:
-        resp = requests.post(
-            f"{CLOVA_SPEECH_INVOKE_URL}/recognizer/url",
-            headers=headers, json=body, timeout=120,
-        )
-        if not resp.ok:
-            logger.error(f"[CLOVA] {resp.status_code} 본문: {resp.text}")
-            raise ValueError(f"CLOVA {resp.status_code}: {resp.text}")
-        data = resp.json()
-        transcript = _extract_transcript(data)
-        if not (transcript or "").strip():
-            _update_call_status(call_id, status="error", error_message="STT 결과가 비어있습니다")
-            logger.warning(f"[CLOVA] STT 결과 없음 call_id={call_id}")
-            return None
-        _update_call_status(call_id, status="transcribed", stt_result=transcript)
-        logger.info(f"[CLOVA] STT 완료(sync) call_id={call_id} len={len(transcript)}")
-        _invoke_nlp(call_id, transcript)
-        return call_id
+        size = _s3_object_size(s3_key)
+        sync_max = int(os.environ.get("STT_SYNC_MAX_BYTES", "1200000"))
+
+        if size and size <= sync_max:
+            logger.info(f"[CLOVA] sync 시도 call_id={call_id} size={size}")
+            sync_result = _request_clova_sync(call_id, presigned_url)
+            if sync_result:
+                return sync_result
+            logger.warning(f"[CLOVA] sync 실패/빈결과 → async fallback call_id={call_id}")
+
+        logger.info(f"[CLOVA] async 시도 call_id={call_id} size={size}")
+        return _request_clova_async(call_id, presigned_url)
+
     except Exception as e:
-        logger.error(f"[CLOVA] STT 요청 실패 call_id={call_id}: {e}")
+        logger.error(f"[CLOVA] STT 요청 오류 call_id={call_id}: {e}", exc_info=True)
         _update_call_status(call_id, status="error", error_message=str(e))
         return None
-
-def _link_call_to_customer(call_id: str, extracted: dict, result: dict) -> None:
-    try:
-        phone = _normalize_phone(
-            extracted.get("phone")
-            or extracted.get("customer_phone")
-            or extracted.get("contact")
-            or extracted.get("tel")
-        )
-        name = (
-            extracted.get("customer_name")
-            or extracted.get("name")
-            or result.get("customer_name")
-            or ""
-        )
-
-        if not phone:
-            return
-
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT user_id, store_id, caller_number
-                    FROM calls
-                    WHERE id = %s
-                    LIMIT 1
-                """, (call_id,))
-                call = cur.fetchone()
-                if not call:
-                    return
-
-                uid = call["user_id"]
-                store_id = call["store_id"]
-
-                cur.execute("""
-                    UPDATE calls
-                    SET caller_number = CASE
-                            WHEN caller_number IS NULL OR caller_number = '' THEN %s
-                            ELSE caller_number
-                        END,
-                        caller_name = CASE
-                            WHEN caller_name IS NULL OR caller_name = '' THEN %s
-                            ELSE caller_name
-                        END
-                    WHERE id = %s
-                """, (phone, name, call_id))
-
-                cur.execute("""
-                    INSERT INTO customer_profiles
-                        (id, user_id, phone, custom_fields)
-                    VALUES
-                        (%s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                        updated_at = NOW()
-                """, (
-                    str(uuid.uuid4()),
-                    uid,
-                    phone,
-                    json.dumps({"name": name}, ensure_ascii=False) if name else None,
-                ))
-
-            conn.commit()
-
-        _upsert_caller_stats(call_id)
-
-        summaries = _fetch_customer_summaries(uid, phone)
-        if summaries:
-            analysis_text = _invoke_customer_analysis(phone, summaries)
-            if analysis_text:
-                _save_customer_analysis(uid, phone, analysis_text, len(summaries))
-
-        logger.info(f"[CustomerLink] call_id={call_id} phone={_mask_phone(phone)} linked")
-
-    except Exception as e:
-        logger.error(f"[CustomerLink] 실패 call_id={call_id}: {e}", exc_info=True)
 
 
 
@@ -353,41 +374,73 @@ def _query_pending_calls() -> list[dict]:
 
 def _poll_clova(call_id: str, job_id: str, retry_count: int) -> bool:
     logger.info(f"[CLOVA] 재조회 call_id={call_id} job_id={job_id} retry={retry_count}")
-    try:
-        headers = {
-            "Accept":                "application/json",
-            "X-CLOVASPEECH-API-KEY": CLOVA_SPEECH_SECRET_KEY,
-        }
-        resp = requests.get(
-            f"{CLOVA_SPEECH_INVOKE_URL}/recognizer/upload/{job_id}",
-            headers=headers, timeout=10,
-        )
-        resp.raise_for_status()
-        data   = resp.json()
-        status = data.get("status", "").lower()
 
-        if status == "completed":
-            transcript = _extract_transcript(data)
-            if not (transcript or "").strip():
-                _update_call_status(call_id, status="error", error_message="STT 결과가 비어있습니다")
-                logger.warning(f"[CLOVA] STT 결과 없음 call_id={call_id}")
+    headers = {
+        "Accept": "application/json",
+        "X-CLOVASPEECH-API-KEY": CLOVA_SPEECH_SECRET_KEY,
+    }
+
+    poll_urls = [
+        f"{CLOVA_SPEECH_INVOKE_URL}/recognizer/upload/{job_id}",
+        f"{CLOVA_SPEECH_INVOKE_URL}/recognizer/url/{job_id}",
+        f"{CLOVA_SPEECH_INVOKE_URL}/recognizer/{job_id}",
+    ]
+
+    last_error = ""
+
+    for url in poll_urls:
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+
+            if resp.status_code in (404, 405):
+                last_error = f"{resp.status_code} {url}"
+                continue
+
+            if not resp.ok:
+                last_error = f"{resp.status_code}: {resp.text[:500]}"
+                logger.warning(f"[CLOVA] polling 실패 후보 url={url} body={resp.text[:500]}")
+                continue
+
+            data = resp.json()
+            transcript = (_extract_transcript(data) or "").strip()
+
+            if transcript:
+                _update_call_status(call_id, status="transcribed", stt_result=transcript)
+                logger.info(f"[CLOVA] 완료 call_id={call_id} len={len(transcript)}")
+                _invoke_nlp(call_id, transcript)
+                return True
+
+            status = str(
+                data.get("status")
+                or data.get("result")
+                or data.get("state")
+                or ""
+            ).lower()
+
+            if status in ("failed", "error", "fail"):
+                logger.warning(
+                    f"[CLOVA] 실패 call_id={call_id} "
+                    f"body={json.dumps(data, ensure_ascii=False)[:1000]}"
+                )
+                _update_call_status(call_id, status="error", error_message=f"CLOVA failed: {status}")
+                _increment_retry(call_id, force_max=True)
                 return False
-            _update_call_status(call_id, status="transcribed", stt_result=transcript)
-            logger.info(f"[CLOVA] 완료 call_id={call_id}")
-            _invoke_nlp(call_id, transcript)
-            return True
-        elif status in ("failed", "error"):
-            logger.warning(f"[CLOVA] 실패 → 최대 재시도로 전환 call_id={call_id}")
-            _increment_retry(call_id, force_max=True)
-            return False
-        else:
+
+            logger.info(
+                f"[CLOVA] 진행중 call_id={call_id} status={status or 'unknown'} "
+                f"body={json.dumps(data, ensure_ascii=False)[:800]}"
+            )
             _increment_retry(call_id, retry_count=retry_count)
-            logger.info(f"[CLOVA] 진행중 call_id={call_id} status={status}")
             return False
-    except Exception as e:
-        logger.error(f"[CLOVA] 재조회 오류 call_id={call_id}: {e}")
-        _increment_retry(call_id, retry_count=retry_count)
-        return False
+
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(f"[CLOVA] polling 후보 실패 url={url} error={e}")
+
+    logger.warning(f"[CLOVA] 재조회 endpoint 미확정 call_id={call_id} last={last_error}")
+    _increment_retry(call_id, retry_count=retry_count)
+    return False
+
 
 
 def _extract_transcript(data: dict) -> str:
@@ -1184,21 +1237,47 @@ def _handle_call_process(event: dict, call_id: str) -> dict:
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT s3_key FROM calls WHERE id = %s AND user_id = %s", (call_id, uid))
+                cur.execute("""
+                    SELECT s3_key, status, clova_job_id
+                    FROM calls
+                    WHERE id = %s AND user_id = %s
+                """, (call_id, uid))
                 call = cur.fetchone()
+
         if not call:
             return _response(404, {"error": "통화를 찾을 수 없습니다"})
 
-        import customer_handler
-        ok, reason = customer_handler.can_process_call(uid, call_id)
-        if not ok:
-            return _response(403, {"error": reason or "고객 동의가 필요합니다"})
+        if call.get("status") in ("completed", "transcribed"):
+            return _response(200, {
+                "message": "이미 처리 완료",
+                "call_id": call_id,
+                "status": call.get("status"),
+            })
+
+        if call.get("status") == "processing" and call.get("clova_job_id"):
+            return _response(200, {
+                "message": "이미 STT 처리 중",
+                "call_id": call_id,
+                "clova_job_id": call.get("clova_job_id"),
+            })
 
         job_id = request_clova_stt(call_id, call["s3_key"])
-        return _response(200, {"message": "STT 처리 시작", "clova_job_id": job_id})
+        if not job_id:
+            return _response(422, {
+                "error": "CLOVA STT 요청 실패",
+                "call_id": call_id,
+            })
+
+        return _response(200, {
+            "message": "STT 처리 예약",
+            "call_id": call_id,
+            "clova_job_id": job_id,
+        })
+
     except Exception as e:
         logger.exception(f"[Call] process 오류: {e}")
         return _response(500, {"error": "내부 오류"})
+
 
 
 def _handle_upload(event: dict) -> dict:
