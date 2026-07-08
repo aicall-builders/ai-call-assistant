@@ -988,23 +988,36 @@ def lambda_handler(event: dict, context) -> dict:
 def _get_current_user_id(event: dict) -> str | None:
     headers = event.get("headers", {}) or {}
     auth_header = headers.get("Authorization") or headers.get("authorization") or ""
+    logger.info(
+        "[Auth] header check authorization_present=%s header_keys=%s",
+        bool(auth_header),
+        ",".join(sorted(headers.keys()))[:500],
+    )
     if not auth_header.startswith("Bearer "):
+        logger.warning("[Auth] Authorization Bearer header missing")
         return None
     try:
         from auth_handler import verify_firebase_token
         decoded = verify_firebase_token(auth_header[7:])
         if not decoded:
+            logger.warning("[Auth] Firebase token verify failed")
             return None
         firebase_uid = decoded.get("uid") or decoded.get("user_id") or decoded.get("sub")
+        logger.info("[Auth] decoded firebase_uid=%s", firebase_uid)
         if not firebase_uid:
+            logger.warning("[Auth] decoded token uid missing decoded_keys=%s", ",".join(decoded.keys()))
             return None
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT id FROM users WHERE firebase_uid = %s LIMIT 1", (firebase_uid,))
                 user = cur.fetchone()
-        return user["id"] if user else None
+        if not user:
+            logger.warning("[Auth] users mapping missing firebase_uid=%s", firebase_uid)
+            return None
+        logger.info("[Auth] users mapping ok firebase_uid=%s user_id=%s", firebase_uid, user["id"])
+        return user["id"]
     except Exception as e:
-        logger.error(f"[Call] _get_current_user_id 오류: {e}")
+        logger.error(f"[Call] _get_current_user_id error: {e}", exc_info=True)
         return None
 
 
