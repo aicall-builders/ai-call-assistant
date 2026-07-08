@@ -250,12 +250,40 @@ def _token_cache_key(token):
     return f"auth:token:{hashlib.sha256(token.encode()).hexdigest()}"
 
 
+def _b64url_decode(value: str) -> bytes:
+    padding_len = (-len(value)) % 4
+    return base64.urlsafe_b64decode((value + ("=" * padding_len)).encode("ascii"))
+
+
+def _jwt_payload_unverified(token: str) -> dict:
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return {}
+        return json.loads(_b64url_decode(parts[1]).decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def _is_firebase_custom_token_payload(payload: dict) -> bool:
+    return (
+        isinstance(payload, dict)
+        and payload.get("aud") == "https://identitytoolkit.googleapis.com/google.identity.identitytoolkit.v1.IdentityToolkit"
+        and bool(payload.get("uid"))
+    )
+
+
 def verify_firebase_token(firebase_id_token):
     cache_key = _token_cache_key(firebase_id_token)
     cached = cache_get(cache_key)
     if cached is not None:
         return cached
     try:
+        unverified_payload = _jwt_payload_unverified(firebase_id_token)
+        if _is_firebase_custom_token_payload(unverified_payload):
+            logger.warning("[Auth] Firebase custom token used as API bearer uid=%s", unverified_payload.get("uid"))
+            return None
+
         _init_firebase()
         decoded = firebase_auth.verify_id_token(firebase_id_token, check_revoked=True)
         payload = {
@@ -457,14 +485,18 @@ def _fetch_profile(provider, access_token, id_token=None):
             "nickname": data.get("nickname") or data.get("name") or "Naver 사용자",
         }
     if provider == "kakao":
-        res = requests.get(
-            "https://kapi.kakao.com/v2/user/me",
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=10,
-        )
-        if res.status_code >= 400:
-            raise RuntimeError(f"Kakao 사용자 정보 조회 실패: HTTP {res.status_code} {res.text[:300]}")
-        data = res.json()
+        try:
+            res = _oauth_get_with_retries(
+                "https://kapi.kakao.com/v2/user/me",
+                headers={"Authorization": f"Bearer {access_token}"},
+                provider="kakao",
+            )
+            if res.status_code >= 400:
+                raise RuntimeError(f"Kakao 사용자 정보 조회 실패: HTTP {res.status_code} {res.text[:300]}")
+            data = res.json()
+        except Exception as exc:
+            logger.warning("[Auth] Kakao user/me failed; trying access_token_info error=%s", exc)
+            return _fetch_kakao_token_info(access_token)
         account = data.get("kakao_account") or {}
         profile = account.get("profile") or {}
         return {
@@ -474,6 +506,48 @@ def _fetch_profile(provider, access_token, id_token=None):
             "nickname": profile.get("nickname") or "Kakao 사용자",
         }
     raise ValueError("지원하지 않는 provider")
+
+
+def _oauth_get_with_retries(url, *, provider, headers=None, params=None, attempts=2):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return requests.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=(5, 20),
+            )
+        except requests.RequestException as exc:
+            last_error = exc
+            logger.warning(
+                "[Auth] OAuth provider GET failed provider=%s attempt=%s/%s error=%s",
+                provider,
+                attempt,
+                attempts,
+                exc.__class__.__name__,
+            )
+    raise RuntimeError(f"{provider} OAuth API 연결 실패: {last_error}")
+
+
+def _fetch_kakao_token_info(access_token):
+    res = _oauth_get_with_retries(
+        "https://kapi.kakao.com/v1/user/access_token_info",
+        headers={"Authorization": f"Bearer {access_token}"},
+        provider="kakao-token-info",
+    )
+    if res.status_code >= 400:
+        raise RuntimeError(f"Kakao 토큰 정보 조회 실패: HTTP {res.status_code} {res.text[:300]}")
+    data = res.json()
+    provider_user_id = str(data.get("id") or "").strip()
+    if not provider_user_id:
+        raise RuntimeError("Kakao 토큰 정보에 사용자 id가 없습니다")
+    return {
+        "provider": "kakao",
+        "provider_user_id": provider_user_id,
+        "email": "",
+        "nickname": "Kakao 사용자",
+    }
 
 
 def _upsert_user(profile):
