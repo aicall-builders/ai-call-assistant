@@ -74,6 +74,10 @@ def _mask_phone(phone) -> str:
     return p[:3] + "****" + p[-4:]
 
 
+def _normalize_phone_value(phone) -> str:
+    return "".join(ch for ch in str(phone or "") if ch.isdigit())
+
+
 def _file_hash(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes).hexdigest()
 
@@ -118,18 +122,28 @@ def _content_type(ext: str) -> str:
 # ── calls 테이블 INSERT ───────────────────────────────────────────────────────
 
 def insert_call(user_id: str, store_id: str, s3_key: str,
-                caller_number: str = "", duration: int = 0) -> str:
+                caller_number: str = "", duration: int = 0,
+                direction: str = "unknown") -> str:
     call_id = str(uuid.uuid4())
     sql = """
         INSERT INTO calls
-            (id, store_id, user_id, caller_number, s3_key, status)
+            (id, store_id, user_id, caller_number, s3_key, status, direction)
         VALUES
-            (%s, %s, %s, %s, %s, 'uploaded')
+            (%s, %s, %s, %s, %s, 'uploaded', %s)
     """
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (call_id, store_id, user_id, caller_number, s3_key))
+            cur.execute(sql, (call_id, store_id, user_id, caller_number, s3_key, direction or 'unknown'))
         conn.commit()
+
+    if caller_number:
+        try:
+            import customer_handler
+            customer_handler.ensure_schema()
+            customer_handler._upsert_profile(user_id, caller_number, consent_status="pending")
+        except Exception as e:
+            logger.warning(f"[Customer] profile upsert skipped call_id={call_id} error={e}")
+
     logger.info(f"[Call] calls INSERT call_id={call_id}")
     return call_id
 
@@ -144,6 +158,13 @@ def request_clova_stt(call_id: str, s3_key: str) -> str | None:
         "get_object",
         Params={"Bucket": S3_BUCKET_NAME, "Key": s3_key},
         ExpiresIn=3600,
+    )
+
+    logger.info(
+        f"[CLOVA_ENV] url={CLOVA_SPEECH_INVOKE_URL} "
+        f"secret_len={len(CLOVA_SPEECH_SECRET_KEY)} "
+        f"secret_prefix={CLOVA_SPEECH_SECRET_KEY[:4]} "
+        f"secret_suffix={CLOVA_SPEECH_SECRET_KEY[-4:]}"
     )
 
     headers = {
@@ -169,6 +190,10 @@ def request_clova_stt(call_id: str, s3_key: str) -> str | None:
             raise ValueError(f"CLOVA {resp.status_code}: {resp.text}")
         data = resp.json()
         transcript = _extract_transcript(data)
+        if not (transcript or "").strip():
+            _update_call_status(call_id, status="error", error_message="STT 결과가 비어있습니다")
+            logger.warning(f"[CLOVA] STT 결과 없음 call_id={call_id}")
+            return None
         _update_call_status(call_id, status="transcribed", stt_result=transcript)
         logger.info(f"[CLOVA] STT 완료(sync) call_id={call_id} len={len(transcript)}")
         _invoke_nlp(call_id, transcript)
@@ -177,6 +202,82 @@ def request_clova_stt(call_id: str, s3_key: str) -> str | None:
         logger.error(f"[CLOVA] STT 요청 실패 call_id={call_id}: {e}")
         _update_call_status(call_id, status="error", error_message=str(e))
         return None
+
+def _link_call_to_customer(call_id: str, extracted: dict, result: dict) -> None:
+    try:
+        phone = _normalize_phone(
+            extracted.get("phone")
+            or extracted.get("customer_phone")
+            or extracted.get("contact")
+            or extracted.get("tel")
+        )
+        name = (
+            extracted.get("customer_name")
+            or extracted.get("name")
+            or result.get("customer_name")
+            or ""
+        )
+
+        if not phone:
+            return
+
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT user_id, store_id, caller_number
+                    FROM calls
+                    WHERE id = %s
+                    LIMIT 1
+                """, (call_id,))
+                call = cur.fetchone()
+                if not call:
+                    return
+
+                uid = call["user_id"]
+                store_id = call["store_id"]
+
+                cur.execute("""
+                    UPDATE calls
+                    SET caller_number = CASE
+                            WHEN caller_number IS NULL OR caller_number = '' THEN %s
+                            ELSE caller_number
+                        END,
+                        caller_name = CASE
+                            WHEN caller_name IS NULL OR caller_name = '' THEN %s
+                            ELSE caller_name
+                        END
+                    WHERE id = %s
+                """, (phone, name, call_id))
+
+                cur.execute("""
+                    INSERT INTO customer_profiles
+                        (id, user_id, phone, custom_fields)
+                    VALUES
+                        (%s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        updated_at = NOW()
+                """, (
+                    str(uuid.uuid4()),
+                    uid,
+                    phone,
+                    json.dumps({"name": name}, ensure_ascii=False) if name else None,
+                ))
+
+            conn.commit()
+
+        _upsert_caller_stats(call_id)
+
+        summaries = _fetch_customer_summaries(uid, phone)
+        if summaries:
+            analysis_text = _invoke_customer_analysis(phone, summaries)
+            if analysis_text:
+                _save_customer_analysis(uid, phone, analysis_text, len(summaries))
+
+        logger.info(f"[CustomerLink] call_id={call_id} phone={_mask_phone(phone)} linked")
+
+    except Exception as e:
+        logger.error(f"[CustomerLink] 실패 call_id={call_id}: {e}", exc_info=True)
+
 
 
 # ════════════════════════════════════════════════════════════
@@ -267,6 +368,10 @@ def _poll_clova(call_id: str, job_id: str, retry_count: int) -> bool:
 
         if status == "completed":
             transcript = _extract_transcript(data)
+            if not (transcript or "").strip():
+                _update_call_status(call_id, status="error", error_message="STT 결과가 비어있습니다")
+                logger.warning(f"[CLOVA] STT 결과 없음 call_id={call_id}")
+                return False
             _update_call_status(call_id, status="transcribed", stt_result=transcript)
             logger.info(f"[CLOVA] 완료 call_id={call_id}")
             _invoke_nlp(call_id, transcript)
@@ -354,7 +459,20 @@ def _invoke_nlp(call_id: str, transcript: str) -> None:
                     with conn.cursor() as cur:
                         cur.execute("UPDATE calls SET caller_number = %s WHERE id = %s", (phone, call_id))
                     conn.commit()
+                try:
+                    import customer_handler
+                    if user_id:
+                        customer_handler.ensure_schema()
+                        customer_handler._upsert_profile(user_id, phone, consent_status="pending")
+                except Exception as e:
+                    logger.warning(f"[Customer] NLP profile upsert skipped call_id={call_id} error={e}")
             _upsert_caller_stats(call_id) 
+            try:
+                import customer_handler
+                if user_id and phone:
+                    customer_handler._refresh_customer_analysis(user_id, phone, reason="call_summary")
+            except Exception as e:
+                logger.warning(f"[CustomerAnalysis] refresh skipped call_id={call_id} error={e}")
             _update_call_status(call_id, status="completed")
         logger.info(f"[NLP] 분석 및 저장 완료 call_id={call_id}")
     except Exception as e:
@@ -405,6 +523,23 @@ def _insert_summary(call_id: str, result: dict) -> None:
         conn.commit()
     logger.info(f"[Call] summaries INSERT 완료 call_id={call_id} domain={result.get('domain', '기타')}")
 
+    try:
+        import customer_handler
+        linked = customer_handler.link_call_to_customer_from_analysis(call_id, clean_extracted, result)
+        if linked:
+            _upsert_caller_stats(call_id)
+    except Exception as e:
+        logger.warning(f"[CustomerLink] skipped call_id={call_id}: {e}")
+
+
+def _normalize_phone(raw: str | None) -> str:
+    if not raw:
+        return ""
+    return "".join(ch for ch in str(raw) if ch.isdigit())
+
+
+
+
 # ── DB 업데이트 헬퍼 ──────────────────────────────────────────────────────────
 
 def _update_call_status(call_id: str, *, status: str,
@@ -419,10 +554,25 @@ def _update_call_status(call_id: str, *, status: str,
         values.append(clova_job_id)
     if stt_result is not None:
         fields.append("stt_result = %s")
-        values.append(stt_result)
+        if stt_result == "":
+            values.append(None)
+        elif isinstance(stt_result, (dict, list)):
+            values.append(json.dumps(stt_result, ensure_ascii=False))
+        else:
+            text = str(stt_result)
+            if not text:
+                values.append(None)
+            else:
+                try:
+                    parsed = json.loads(text)
+                    values.append(json.dumps(parsed, ensure_ascii=False))
+                except Exception:
+                    values.append(json.dumps({"text": text}, ensure_ascii=False))
     if error_message is not None:
         fields.append("error_message = %s")
         values.append(error_message)
+    elif status != "error":
+        fields.append("error_message = NULL")
 
     values.append(call_id)
     sql = f"UPDATE calls SET {', '.join(fields)} WHERE id = %s"
@@ -474,9 +624,147 @@ def _event_with_path(event: dict, path: str, method: str) -> dict:
     return copied
 
 
+
+def _s3_object_exists(s3_key: str) -> bool:
+    try:
+        s3.head_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+        return True
+    except Exception:
+        return False
+
+
+def _process_consented_calls(event: dict) -> dict:
+    """
+    동의 완료 고객의 기존 uploaded 통화 자동 처리.
+    - 동의 상태 확인
+    - S3 파일 존재 확인
+    - status=uploaded 인 항목만 원자적으로 processing 전환
+    - 중복 실행 방지
+    """
+    uid = event.get("user_id") or ""
+    phone = _normalize_phone_value(event.get("phone") or "")
+    try:
+        limit = max(1, min(int(event.get("limit") or 3), 5))
+    except Exception:
+        limit = 3
+
+    result = {"phone": phone, "checked": 0, "processed": 0, "skipped": 0, "failed": 0}
+
+    if not uid or not phone:
+        return {"statusCode": 400, "body": json.dumps({"error": "user_id/phone 필수"}, ensure_ascii=False)}
+
+    try:
+        import customer_handler
+        if not customer_handler._is_consented(uid, phone):
+            return {"statusCode": 200, "body": json.dumps({**result, "message": "동의 상태 아님"}, ensure_ascii=False)}
+    except Exception as e:
+        logger.warning(f"[ConsentProcess] consent check failed uid={uid} phone={_mask_phone(phone)} error={e}")
+        return {"statusCode": 200, "body": json.dumps({**result, "message": "동의 확인 실패"}, ensure_ascii=False)}
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, s3_key, caller_number, status
+                FROM calls
+                WHERE user_id=%s
+                  AND status IN ('uploaded', 'consent_required')
+                  AND caller_number IS NOT NULL
+                  AND caller_number <> ''
+                ORDER BY created_at ASC
+                LIMIT 100
+            """, (uid,))
+            rows = cur.fetchall() or []
+
+    for row in rows:
+        if result["processed"] >= limit:
+            break
+
+        result["checked"] += 1
+        call_id = row.get("id")
+        s3_key = row.get("s3_key") or ""
+        row_phone = _normalize_phone_value(row.get("caller_number") or "")
+
+        if row_phone != phone:
+            result["skipped"] += 1
+            continue
+
+        if not s3_key or not _s3_object_exists(s3_key):
+            result["skipped"] += 1
+            continue
+
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE calls
+                        SET status='processing', updated_at=NOW()
+                        WHERE id=%s
+                          AND user_id=%s
+                          AND status IN ('uploaded', 'consent_required')
+                    """, (call_id, uid))
+                    changed = cur.rowcount
+                conn.commit()
+
+            if not changed:
+                result["skipped"] += 1
+                continue
+
+            request_clova_stt(call_id, s3_key)
+            result["processed"] += 1
+        except Exception as e:
+            logger.warning(f"[ConsentProcess] call process failed call_id={call_id} error={e}")
+            result["failed"] += 1
+
+    return {"statusCode": 200, "body": json.dumps(result, ensure_ascii=False)}
+
+
+def _column_exists(cur, table_name: str, column_name: str) -> bool:
+    cur.execute("""
+        SELECT COUNT(*) AS cnt
+        FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = %s
+          AND column_name = %s
+    """, (table_name, column_name))
+    return int((cur.fetchone() or {}).get("cnt", 0)) > 0
+
+
+def _migrate_missing_upload_columns() -> dict:
+    try:
+        changed = []
+
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                if not _column_exists(cur, "summaries", "id"):
+                    cur.execute("ALTER TABLE summaries ADD COLUMN id VARCHAR(36) NULL FIRST")
+                    cur.execute("UPDATE summaries SET id = UUID() WHERE id IS NULL OR id = ''")
+                    changed.append("summaries.id")
+
+                if not _column_exists(cur, "calls", "caller_name"):
+                    cur.execute("ALTER TABLE calls ADD COLUMN caller_name VARCHAR(255) NULL")
+                    changed.append("calls.caller_name")
+
+                if not _column_exists(cur, "calls", "caller_category"):
+                    cur.execute("ALTER TABLE calls ADD COLUMN caller_category VARCHAR(32) NULL DEFAULT 'UNCLASSIFIED'")
+                    changed.append("calls.caller_category")
+
+            conn.commit()
+
+        return _response(200, {
+            "message": "missing upload columns migrated",
+            "changed": changed,
+        })
+
+    except Exception as e:
+        logger.exception(f"[Migrate] missing upload columns 오류: {e}")
+        return _response(500, {"error": str(e)})
+
+
 # ── Lambda 핸들러 ─────────────────────────────────────────────────────────────
 
 def lambda_handler(event: dict, context) -> dict:
+    if event.get("action") == "migrate_missing_upload_columns":
+        return _migrate_missing_upload_columns()
     if event.get("action") == "clean_extracted_info":
         return _clean_extracted_info()
     if event.get("action") == "migrate_caller_stats": 
@@ -489,6 +777,8 @@ def lambda_handler(event: dict, context) -> dict:
         return _migrate_customer_profiles()
     if event.get("action") == "generate_customer_analysis":
         return _run_customer_analysis_batch()
+    if event.get("action") == "process_consented_calls":
+        return _process_consented_calls(event)
 
     
     path   = _normalize_path(event)
@@ -506,6 +796,11 @@ def lambda_handler(event: dict, context) -> dict:
         return _response(200, {"message": "OK"}, event)
 
     routed_event = _event_with_path(event, path, method)
+
+    # customer consent/history routes
+    if path.startswith("/consent/") or path.startswith("/customers/"):
+        import customer_handler
+        return customer_handler.lambda_handler(routed_event, context)
 
     # auth 라우트
     if path.startswith("/auth/"):
@@ -570,17 +865,11 @@ def lambda_handler(event: dict, context) -> dict:
     if path == "/calls/upload" and method == "POST":
         return _handle_upload(routed_event)
 
-    # customers (고객 프로필 + AI 분석)
-    #   GET  /customers/{phone}  → 프로필 + 분석 조회
-    #   PATCH /customers/{phone} → 편집 필드 저장
-    #   phone은 URL 인코딩되어 들어옴. 소유 통화에 있는 번호만 허용(BOLA 방지).
-    if path.startswith("/customers/"):
-        import urllib.parse
-        phone = urllib.parse.unquote(path.split("/", 2)[2])
-        if method == "GET":
-            return _handle_customer_get(routed_event, phone)
-        if method == "PATCH":
-            return _handle_customer_patch(routed_event, phone)
+    # customers
+    # customer_profiles 기준 고객 목록/상세/동의/메모/히스토리 공통 처리
+    if path == "/customers" or path.startswith("/customers/") or path.startswith("/consent/"):
+        import customer_handler
+        return customer_handler.lambda_handler(routed_event, context)
 
     # ── 임시 마이그레이션 라우트 제거됨 (보안) ──
     # /migrate/caller-name, /migrate/user-domain 공개 라우트는 인증 없이
@@ -626,7 +915,7 @@ def _assert_owns_store(uid: str, store_id: str) -> bool:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT 1 FROM stores WHERE id = %s AND owner_id = %s LIMIT 1",
+                    "SELECT 1 FROM stores WHERE id = %s AND user_id = %s LIMIT 1",
                     (store_id, uid),
                 )
                 return cur.fetchone() is not None
@@ -643,7 +932,7 @@ def _handle_stores_list(event: dict) -> dict:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, name, owner_id, created_at FROM stores WHERE owner_id = %s",
+                    "SELECT id, name, user_id, created_at FROM stores WHERE user_id = %s",
                     (uid,)
                 )
                 stores = cur.fetchall()
@@ -667,7 +956,7 @@ def _handle_stores_create(event: dict) -> dict:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO stores (id, name, owner_id) VALUES (%s, %s, %s)",
+                    "INSERT INTO stores (id, name, user_id) VALUES (%s, %s, %s)",
                     (store_id, name, uid)
                 )
             conn.commit()
@@ -899,6 +1188,12 @@ def _handle_call_process(event: dict, call_id: str) -> dict:
                 call = cur.fetchone()
         if not call:
             return _response(404, {"error": "통화를 찾을 수 없습니다"})
+
+        import customer_handler
+        ok, reason = customer_handler.can_process_call(uid, call_id)
+        if not ok:
+            return _response(403, {"error": reason or "고객 동의가 필요합니다"})
+
         job_id = request_clova_stt(call_id, call["s3_key"])
         return _response(200, {"message": "STT 처리 시작", "clova_job_id": job_id})
     except Exception as e:
@@ -935,7 +1230,12 @@ def _handle_upload(event: dict) -> dict:
 
         call_id          = str(uuid.uuid4())
         s3_key           = f"recordings/{store_id}/{call_id}/{file_name}"
-        counterpart_number = body.get("counterpart_number", "").strip()  # ← 추가
+        counterpart_number = (
+            body.get("caller_number")
+            or body.get("counterpart_number")
+            or body.get("phone")
+            or ""
+        ).strip()
 
         # 통화 길이(초) — 앱이 duration_seconds로 보냄. 없으면 0.
         try:
@@ -963,6 +1263,14 @@ def _handle_upload(event: dict) -> dict:
             with conn.cursor() as cur:
                 cur.execute(sql, (call_id, store_id, uid, s3_key, counterpart_number, duration_sec))
             conn.commit()
+
+        if counterpart_number:
+            try:
+                import customer_handler
+                customer_handler.ensure_schema()
+                customer_handler._upsert_profile(uid, counterpart_number, consent_status="pending")
+            except Exception as e:
+                logger.warning(f"[Customer] upload profile upsert skipped call_id={call_id} error={e}")
 
         return _response(200, {
             "call_id":        call_id,
@@ -1301,6 +1609,12 @@ def _run_customer_analysis_batch() -> dict:
 
 
 def _fetch_customer_summaries(uid: str, phone: str) -> list[str]:
+    try:
+        import customer_handler
+        return customer_handler.fetch_customer_analysis_items(uid, phone)
+    except Exception as e:
+        logger.warning(f"[CustomerAI] 확장 히스토리 조회 실패, 기존 요약 조회로 fallback: {e}")
+
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
