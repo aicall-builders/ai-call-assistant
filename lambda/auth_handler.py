@@ -42,6 +42,7 @@ logger.setLevel(logging.INFO)
 
 SUPPORTED_OAUTH_PROVIDERS = {"kakao", "google", "naver"}
 AWS_CLIENT_CONFIG = Config(connect_timeout=3, read_timeout=3, retries={"max_attempts": 1})
+AUTH_HANDLER_BUILD = "2026-07-09-kakao-fallback-v2"
 
 
 def _load_firebase_service_account() -> dict:
@@ -485,26 +486,7 @@ def _fetch_profile(provider, access_token, id_token=None):
             "nickname": data.get("nickname") or data.get("name") or "Naver 사용자",
         }
     if provider == "kakao":
-        try:
-            res = _oauth_get_with_retries(
-                "https://kapi.kakao.com/v2/user/me",
-                headers={"Authorization": f"Bearer {access_token}"},
-                provider="kakao",
-            )
-            if res.status_code >= 400:
-                raise RuntimeError(f"Kakao 사용자 정보 조회 실패: HTTP {res.status_code} {res.text[:300]}")
-            data = res.json()
-        except Exception as exc:
-            logger.warning("[Auth] Kakao user/me failed; trying access_token_info error=%s", exc)
-            return _fetch_kakao_token_info(access_token)
-        account = data.get("kakao_account") or {}
-        profile = account.get("profile") or {}
-        return {
-            "provider": "kakao",
-            "provider_user_id": str(data.get("id") or ""),
-            "email": account.get("email") or "",
-            "nickname": profile.get("nickname") or "Kakao 사용자",
-        }
+        return _fetch_kakao_token_info(access_token)
     raise ValueError("지원하지 않는 provider")
 
 
@@ -650,6 +632,7 @@ def _handle_provider_login(event, provider):
         return _response(400, {"error": "provider는 kakao/google/naver 중 하나여야 합니다"}, event)
 
     try:
+        logger.info("[Auth] provider login start provider=%s build=%s", provider, AUTH_HANDLER_BUILD)
         access_token = body.get("provider_access_token") or body.get("access_token") or body.get(f"{provider}_access_token")
         id_token = None  # 반드시 먼저 초기화
 
