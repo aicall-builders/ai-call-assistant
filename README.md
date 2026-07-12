@@ -1,5 +1,7 @@
 # FIANO Backend
 
+Deployment URL: https://dsoh4vn0si08a.cloudfront.net/
+
 소상공인을 위한 AI 통화 요약 서비스 FIANO의 백엔드입니다. AWS Lambda 기반으로 인증, 통화 업로드, STT 처리, AI 요약, 고객·일정 데이터를 제공합니다.
 
 ## 주요 기능
